@@ -1,0 +1,3 @@
+# Fixtures
+fixtures/
+!fixtures/*.c

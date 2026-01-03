@@ -1,0 +1,128 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+# vim: set ts=2 sw=2 tw=0 fo=cnqoj
+version: 2
+
+project_name: ida-mcp
+
+before:
+  hooks:
+    - rustup default stable
+    - cargo fetch --locked
+
+builds:
+  - id: ida-mcp
+    builder: rust
+    binary: ida-mcp
+    # Use native cargo build (not zigbuild) since idalib requires IDA Pro libraries
+    # Cross-compilation is NOT supported - idalib links against arch-specific IDA libraries
+    command: build
+    targets:
+      # Build only for native architecture - cross-compilation not possible with idalib
+      # On Apple Silicon Mac, this builds aarch64; on Intel Mac, this builds x86_64
+      - aarch64-apple-darwin
+    flags:
+      - --release
+      - --locked
+    env:
+      # IDADIR defaults to IDA 9.2 on macOS, override via environment if needed
+      - IDADIR={{ if index .Env "IDADIR" }}{{ .Env.IDADIR }}{{ else }}/Applications/IDA Professional 9.2.app/Contents/MacOS{{ end }}
+
+# NOTE: Universal binaries are NOT possible with idalib because each arch needs
+# its own IDA libraries at link time. Build on each architecture separately.
+
+archives:
+  - id: default
+    formats:
+      - tar.gz
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "all" }}universal
+      {{- else if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+      - Merge pull request
+      - Merge branch
+  groups:
+    - title: "New Features"
+      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+      order: 0
+    - title: "Bug Fixes"
+      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+      order: 1
+    - title: "Other"
+      order: 999
+
+release:
+  github:
+    owner: blacktop
+    name: ida-mcp-rs
+  draft: false
+  prerelease: auto
+  mode: replace
+  header: |
+    ## IDA Pro MCP Server {{ .Tag }}
+
+    Headless IDA Pro analysis via MCP protocol.
+
+    ### Requirements
+    - **IDA Pro 9.2+** with valid license (RPATH is set at build time)
+  footer: |
+    ---
+
+    **Full Changelog**: https://github.com/blacktop/ida-mcp-rs/compare/{{ .PreviousTag }}...{{ .Tag }}
+
+# Homebrew Cask for macOS distribution
+homebrew_casks:
+  - name: ida-mcp
+    ids:
+      - default
+    repository:
+      owner: blacktop
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    commit_author:
+      name: goreleaserbot
+      email: bot@goreleaser.com
+    commit_msg_template: "Homebrew Cask update for {{ .ProjectName }} version {{ .Tag }}"
+    homepage: https://github.com/blacktop/ida-mcp-rs
+    description: Headless IDA Pro MCP Server for AI-powered binary analysis
+    license: MIT
+    # Remove quarantine for unsigned binary
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            Dir.glob("#{staged_path}/**/ida-mcp").each do |f|
+              system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", f]
+            end
+          end
+    caveats: "ida-mcp requires IDA Pro 9.2+ to be installed."
+    # Skip upload for prereleases
+    skip_upload: auto
+
+# Generate source archive
+source:
+  enabled: true
+  name_template: "{{ .ProjectName }}_{{ .Version }}_source"
+
+# Software Bill of Materials
+sboms:
+  - artifacts: archive

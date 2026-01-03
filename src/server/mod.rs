@@ -1,0 +1,2306 @@
+//! MCP server implementation with IDA Pro tools.
+
+mod requests;
+
+pub use requests::*;
+
+use crate::error::ToolError;
+use crate::ida::IdaWorker;
+use crate::tool_registry::{self, ToolCategory};
+use rmcp::{
+    handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
+    model::{CallToolResult, Content, ServerCapabilities, ServerInfo, Tool},
+    schemars::{schema_for, JsonSchema},
+    service::RequestContext,
+    tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler,
+};
+use serde_json::{json, Value};
+use std::sync::Arc;
+use tracing::{debug, info, instrument};
+
+/// MCP server for IDA Pro analysis
+#[derive(Clone)]
+pub struct IdaMcpServer {
+    worker: Arc<IdaWorker>,
+    tool_mux: ToolMux<IdaMcpServer>,
+}
+
+#[derive(Clone)]
+struct ToolMux<S> {
+    call_router: ToolRouter<S>,
+    enabled: Arc<std::sync::Mutex<tool_registry::EnabledTools>>,
+}
+
+impl<S> ToolMux<S>
+where
+    S: Send + Sync + 'static,
+{
+    fn new(call_router: ToolRouter<S>) -> Self {
+        Self {
+            call_router,
+            enabled: Arc::new(std::sync::Mutex::new(tool_registry::EnabledTools::new())),
+        }
+    }
+
+    async fn call(
+        &self,
+        context: ToolCallContext<'_, S>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.call_router.call(context).await
+    }
+
+    fn list_all(&self) -> Vec<Tool> {
+        let enabled = match self.enabled.lock() {
+            Ok(guard) => guard,
+            Err(guard) => guard.into_inner(),
+        };
+        let mut tools = Vec::new();
+        for info in tool_registry::all_tools() {
+            if enabled.is_enabled(info.name) {
+                if let Some(route) = self.call_router.map.get(info.name) {
+                    tools.push(route.attr.clone());
+                }
+            }
+        }
+        tools
+    }
+
+    fn enabled(&self) -> &Arc<std::sync::Mutex<tool_registry::EnabledTools>> {
+        &self.enabled
+    }
+}
+
+impl IdaMcpServer {
+    pub fn new(worker: Arc<IdaWorker>) -> Self {
+        info!("Creating IDA MCP server");
+        let call_router = Self::tool_router();
+        Self {
+            worker,
+            tool_mux: ToolMux::new(call_router),
+        }
+    }
+
+    fn validate_path(path: &str) -> bool {
+        let path = path.trim();
+        let expanded = if let Some(stripped) = path.strip_prefix("~/") {
+            if let Some(home) = std::env::var_os("HOME") {
+                std::path::PathBuf::from(home).join(stripped)
+            } else {
+                return false;
+            }
+        } else {
+            std::path::PathBuf::from(path)
+        };
+        let p = expanded.as_path();
+        // Check: exists, is file, no path traversal
+        // IDA can open many formats: .i64, .idb, ELF, Mach-O, PE, raw binaries, etc.
+        p.exists() && p.is_file() && !path.contains("..")
+    }
+
+    fn parse_address(s: &str) -> Result<u64, ToolError> {
+        let mut s = s.trim().to_string();
+        s.retain(|c| c != '_');
+        if s.starts_with("0x") || s.starts_with("0X") {
+            u64::from_str_radix(&s[2..], 16).map_err(|_| ToolError::InvalidAddress(s))
+        } else if s.starts_with("0b") || s.starts_with("0B") {
+            u64::from_str_radix(&s[2..], 2).map_err(|_| ToolError::InvalidAddress(s))
+        } else if s.starts_with("0o") || s.starts_with("0O") {
+            u64::from_str_radix(&s[2..], 8).map_err(|_| ToolError::InvalidAddress(s))
+        } else {
+            s.parse()
+                .map_err(|_| ToolError::InvalidAddress(s.to_string()))
+        }
+    }
+
+    fn value_to_strings(value: &Value) -> Result<Vec<String>, ToolError> {
+        match value {
+            Value::String(s) => {
+                if s.contains(',') {
+                    Ok(s.split(',')
+                        .map(|t| t.trim())
+                        .filter(|t| !t.is_empty())
+                        .map(|t| t.to_string())
+                        .collect())
+                } else if s.trim().is_empty() {
+                    Err(ToolError::IdaError("empty string".to_string()))
+                } else {
+                    Ok(vec![s.to_string()])
+                }
+            }
+            Value::Number(n) => Ok(vec![n.to_string()]),
+            Value::Array(arr) => {
+                let mut out = Vec::with_capacity(arr.len());
+                for v in arr {
+                    match v {
+                        Value::String(s) => out.push(s.to_string()),
+                        Value::Number(n) => out.push(n.to_string()),
+                        _ => {
+                            return Err(ToolError::IdaError(
+                                "expected string or number".to_string(),
+                            ))
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            _ => Err(ToolError::IdaError(
+                "expected string, number, or array".to_string(),
+            )),
+        }
+    }
+
+    fn value_to_addresses(value: &Value) -> Result<Vec<u64>, ToolError> {
+        let strings = Self::value_to_strings(value)?;
+        if strings.is_empty() {
+            return Err(ToolError::InvalidAddress(
+                "no addresses provided".to_string(),
+            ));
+        }
+        strings.iter().map(|s| Self::parse_address(s)).collect()
+    }
+
+    fn value_to_single_address(value: &Value) -> Result<u64, ToolError> {
+        let addrs = Self::value_to_addresses(value)?;
+        addrs
+            .into_iter()
+            .next()
+            .ok_or_else(|| ToolError::InvalidAddress("empty address list".to_string()))
+    }
+
+    fn value_to_bytes(value: &Value) -> Result<Vec<u8>, ToolError> {
+        match value {
+            Value::String(s) => {
+                let mut cleaned = String::with_capacity(s.len());
+                for c in s.chars() {
+                    if c.is_ascii_hexdigit() {
+                        cleaned.push(c);
+                    } else if c.is_ascii_whitespace()
+                        || matches!(c, ',' | '_' | ':' | '-')
+                        || c == 'x'
+                        || c == 'X'
+                    {
+                        continue;
+                    } else {
+                        return Err(ToolError::InvalidParams(format!(
+                            "invalid hex character: {c}"
+                        )));
+                    }
+                }
+                if cleaned.is_empty() {
+                    return Err(ToolError::InvalidParams("no bytes provided".to_string()));
+                }
+                if !cleaned.len().is_multiple_of(2) {
+                    return Err(ToolError::InvalidParams(
+                        "hex string has odd length".to_string(),
+                    ));
+                }
+                let mut out = Vec::with_capacity(cleaned.len() / 2);
+                for i in (0..cleaned.len()).step_by(2) {
+                    let byte = u8::from_str_radix(&cleaned[i..i + 2], 16)
+                        .map_err(|_| ToolError::InvalidParams("invalid hex byte".to_string()))?;
+                    out.push(byte);
+                }
+                Ok(out)
+            }
+            Value::Array(arr) => {
+                let mut out = Vec::with_capacity(arr.len());
+                for v in arr {
+                    match v {
+                        Value::Number(n) => {
+                            let byte = n.as_u64().ok_or_else(|| {
+                                ToolError::InvalidParams("invalid byte".to_string())
+                            })?;
+                            if byte > u8::MAX as u64 {
+                                return Err(ToolError::InvalidParams(
+                                    "byte value out of range".to_string(),
+                                ));
+                            }
+                            out.push(byte as u8);
+                        }
+                        Value::String(s) => {
+                            let val = Self::parse_address(s)?;
+                            if val > u8::MAX as u64 {
+                                return Err(ToolError::InvalidParams(
+                                    "byte value out of range".to_string(),
+                                ));
+                            }
+                            out.push(val as u8);
+                        }
+                        _ => {
+                            return Err(ToolError::InvalidParams(
+                                "bytes must be numbers or strings".to_string(),
+                            ))
+                        }
+                    }
+                }
+                if out.is_empty() {
+                    Err(ToolError::InvalidParams("no bytes provided".to_string()))
+                } else {
+                    Ok(out)
+                }
+            }
+            Value::Number(n) => {
+                let byte = n
+                    .as_u64()
+                    .ok_or_else(|| ToolError::InvalidParams("invalid byte".to_string()))?;
+                if byte > u8::MAX as u64 {
+                    return Err(ToolError::InvalidParams(
+                        "byte value out of range".to_string(),
+                    ));
+                }
+                Ok(vec![byte as u8])
+            }
+            _ => Err(ToolError::InvalidParams(
+                "expected hex string or array of bytes".to_string(),
+            )),
+        }
+    }
+}
+
+// Tool implementations using the #[tool_router] attribute
+
+#[tool_router]
+impl IdaMcpServer {
+    #[tool(
+        description = "Open an IDA Pro database (.i64/.idb) or a raw binary (Mach-O/ELF/PE). \
+        Raw binaries are auto-analyzed and saved as .i64 alongside the input. \
+        If opening a raw binary with no existing .i64 and a sibling .dSYM is present, \
+        its DWARF debug info is loaded automatically. \
+        Set load_debug_info=true to force loading external debug info after open \
+        (optionally specify debug_info_path). \
+        NOTE: Opening large databases (like dyld_shared_cache) can take 30+ seconds. \
+        The database stays open until close_idb is called, so you can make multiple \
+        queries (list_functions, disasm, decompile, etc.) without reopening."
+    )]
+    #[instrument(skip(self), fields(path = %req.path))]
+    async fn open_idb(
+        &self,
+        Parameters(req): Parameters<OpenIdbRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: open_idb");
+        // Validate path (prevent directory traversal, check extension)
+        if !Self::validate_path(&req.path) {
+            return Ok(ToolError::InvalidPath(req.path).to_tool_result());
+        }
+
+        match self
+            .worker
+            .open(
+                &req.path,
+                req.load_debug_info.unwrap_or(false),
+                req.debug_info_path.clone(),
+                req.debug_info_verbose.unwrap_or(false),
+            )
+            .await
+        {
+            Ok(info) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&info).unwrap_or_else(|_| format!("{:?}", info)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(
+        description = "Load external debug info (e.g., DWARF/dSYM) into the current database. \
+        If path is omitted, attempts to locate a sibling .dSYM for the currently-open database."
+    )]
+    #[instrument(skip(self))]
+    async fn load_debug_info(
+        &self,
+        Parameters(req): Parameters<LoadDebugInfoRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: load_debug_info");
+        match self
+            .worker
+            .load_debug_info(req.path, req.verbose.unwrap_or(false))
+            .await
+        {
+            Ok(info) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&info).unwrap_or_else(|_| format!("{info:?}")),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Close the currently open IDA database. \
+        Call this when you're done analyzing to free resources. \
+        The database can also be left open for the duration of the session.")]
+    #[instrument(skip(self))]
+    async fn close_idb(&self) -> Result<CallToolResult, McpError> {
+        info!("Tool call: close_idb received");
+        match self.worker.close().await {
+            Ok(()) => {
+                info!("Tool call: close_idb completed successfully");
+                Ok(CallToolResult::success(vec![Content::text(
+                    "Database closed",
+                )]))
+            }
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Discover available tools by query or category. \
+        Use this to find the right tool for your task before calling tool_help for full details.")]
+    #[instrument(skip(self))]
+    async fn tool_catalog(
+        &self,
+        Parameters(req): Parameters<ToolCatalogRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: tool_catalog");
+        let limit = req.limit.unwrap_or(7).min(15);
+
+        // If category specified, list tools in that category
+        if let Some(cat_str) = &req.category {
+            if let Ok(cat) = cat_str.parse::<ToolCategory>() {
+                let tools: Vec<_> = tool_registry::tools_by_category(cat)
+                    .take(limit)
+                    .map(|t| {
+                        json!({
+                            "name": t.name,
+                            "description": t.short_desc,
+                            "category": t.category.as_str(),
+                        })
+                    })
+                    .collect();
+
+                return Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&json!({
+                        "category": cat.as_str(),
+                        "category_description": cat.description(),
+                        "tools": tools,
+                        "hint": "Use tool_help(name) for full documentation and examples"
+                    }))
+                    .unwrap(),
+                )]));
+            }
+        }
+
+        // If query specified, search for matching tools
+        if let Some(query) = &req.query {
+            let results = tool_registry::search_tools(query, limit);
+            let tools: Vec<_> = results
+                .iter()
+                .map(|(t, keywords)| {
+                    json!({
+                        "name": t.name,
+                        "description": t.short_desc,
+                        "category": t.category.as_str(),
+                        "matched": keywords,
+                    })
+                })
+                .collect();
+
+            return Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&json!({
+                    "query": query,
+                    "tools": tools,
+                    "hint": "Use tool_help(name) for full documentation and examples"
+                }))
+                .unwrap(),
+            )]));
+        }
+
+        // No query or category - list all categories
+        let categories: Vec<_> = ToolCategory::all()
+            .iter()
+            .map(|c| {
+                let count = tool_registry::tools_by_category(*c).count();
+                json!({
+                    "category": c.as_str(),
+                    "description": c.description(),
+                    "tool_count": count,
+                })
+            })
+            .collect();
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&json!({
+                "categories": categories,
+                "hint": "Use tool_catalog(category='...') to list tools in a category, or tool_catalog(query='...') to search. Use enable_tools to expose categories in tools/list."
+            }))
+            .unwrap(),
+        )]))
+    }
+
+    #[tool(
+        description = "Get full documentation for a tool including description, parameters schema, and example."
+    )]
+    #[instrument(skip(self))]
+    async fn tool_help(
+        &self,
+        Parameters(req): Parameters<ToolHelpRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: tool_help for {}", req.name);
+
+        if let Some(tool) = tool_registry::get_tool(&req.name) {
+            let params = tool_params_schema(&req.name);
+            Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&json!({
+                    "name": tool.name,
+                    "category": tool.category.as_str(),
+                    "description": tool.full_desc,
+                    "parameters": params,
+                    "example": tool.example,
+                    "keywords": tool.keywords,
+                }))
+                .unwrap(),
+            )]))
+        } else {
+            // Suggest similar tools
+            let suggestions = tool_registry::search_tools(&req.name, 3);
+            let suggestion_names: Vec<_> = suggestions.iter().map(|(t, _)| t.name).collect();
+
+            Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&json!({
+                    "error": format!("Tool '{}' not found", req.name),
+                    "suggestions": suggestion_names,
+                    "hint": "Use tool_catalog to discover available tools"
+                }))
+                .unwrap(),
+            )]))
+        }
+    }
+
+    #[tool(
+        description = "Enable tool categories or tools to appear in tools/list. \
+        Sends notifications/tools/list_changed when the visible tool list changes."
+    )]
+    #[instrument(skip(self))]
+    async fn enable_tools(
+        &self,
+        Parameters(req): Parameters<EnableToolsRequest>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: enable_tools");
+
+        if req.categories.is_none() && req.tools.is_none() {
+            return Ok(
+                ToolError::InvalidParams("categories or tools required".to_string())
+                    .to_tool_result(),
+            );
+        }
+
+        let categories = match req.categories {
+            Some(v) => match Self::value_to_strings(&v) {
+                Ok(v) => v,
+                Err(e) => return Ok(e.to_tool_result()),
+            },
+            None => Vec::new(),
+        };
+        let tools = match req.tools {
+            Some(v) => match Self::value_to_strings(&v) {
+                Ok(v) => v,
+                Err(e) => return Ok(e.to_tool_result()),
+            },
+            None => Vec::new(),
+        };
+
+        let mut newly_enabled_categories = Vec::new();
+        let mut newly_enabled_tools = Vec::new();
+
+        let (changed, total_enabled, enabled_categories) = {
+            let enabled = self.tool_mux.enabled();
+            let mut enabled = match enabled.lock() {
+                Ok(g) => g,
+                Err(g) => g.into_inner(),
+            };
+
+            for cat_str in categories {
+                let category = match cat_str.parse::<ToolCategory>() {
+                    Ok(c) => c,
+                    Err(_) => return Ok(ToolError::InvalidToolCategory(cat_str).to_tool_result()),
+                };
+                if enabled.enable_category(category) {
+                    newly_enabled_categories.push(category.as_str());
+                }
+            }
+
+            for tool_str in tools {
+                let tool = match tool_registry::get_tool(&tool_str) {
+                    Some(t) => t,
+                    None => return Ok(ToolError::InvalidToolName(tool_str).to_tool_result()),
+                };
+                if enabled.enable_tool(tool.name) {
+                    newly_enabled_tools.push(tool.name);
+                }
+            }
+
+            let changed = !(newly_enabled_categories.is_empty() && newly_enabled_tools.is_empty());
+            let total_enabled = enabled.enabled_count();
+            let mut enabled_categories: Vec<_> =
+                enabled.enabled_categories().map(|c| c.as_str()).collect();
+            enabled_categories.sort_unstable();
+            (changed, total_enabled, enabled_categories)
+        };
+
+        if changed {
+            let _ = ctx.peer.notify_tool_list_changed().await;
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&json!({
+                "changed": changed,
+                "newly_enabled_categories": newly_enabled_categories,
+                "newly_enabled_tools": newly_enabled_tools,
+                "enabled_categories": enabled_categories,
+                "total_enabled": total_enabled,
+                "hint": "Call tools/list again to refresh tool list"
+            }))
+            .unwrap(),
+        )]))
+    }
+
+    #[tool(description = "List all functions in the database (paginated). \
+        For large databases, consider setting timeout_secs (default: 120, max: 600).")]
+    #[instrument(skip(self), fields(offset = req.offset, limit = req.limit))]
+    async fn list_functions(
+        &self,
+        Parameters(req): Parameters<ListFunctionsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: list_functions");
+        // Clamp limit to prevent excessive responses
+        let limit = req.limit.unwrap_or(100).min(10000);
+        let offset = req.offset.unwrap_or(0);
+        let filter = req.filter.clone();
+
+        match self
+            .worker
+            .list_functions(offset, limit, filter, req.timeout_secs)
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "List functions (ida-pro-mcp compatible alias). \
+        For large databases, consider setting timeout_secs (default: 120, max: 600).")]
+    #[instrument(skip(self), fields(offset = req.offset, limit = req.limit, filter = ?req.filter))]
+    async fn list_funcs(
+        &self,
+        Parameters(req): Parameters<ListFunctionsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: list_funcs");
+        let limit = req.limit.unwrap_or(100).min(10000);
+        let offset = req.offset.unwrap_or(0);
+        let filter = req.filter.clone();
+
+        match self
+            .worker
+            .list_functions(offset, limit, filter, req.timeout_secs)
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Resolve a function name to its address")]
+    #[instrument(skip(self), fields(name = %req.name))]
+    async fn resolve_function(
+        &self,
+        Parameters(req): Parameters<ResolveFunctionRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: resolve_function");
+        match self.worker.resolve_function(&req.name).await {
+            Ok(info) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&info).unwrap_or_else(|_| format!("{:?}", info)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Get disassembly at an address")]
+    #[instrument(skip(self), fields(address = %req.address, count = req.count))]
+    async fn disasm(
+        &self,
+        Parameters(req): Parameters<DisasmRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: disasm");
+        // Clamp instruction count
+        let count = req.count.unwrap_or(10).min(1000);
+        let addrs = match Self::value_to_addresses(&req.address) {
+            Ok(a) => a,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+
+        if addrs.len() == 1 {
+            match self.worker.disasm(addrs[0], count).await {
+                Ok(text) => Ok(CallToolResult::success(vec![Content::text(text)])),
+                Err(e) => Ok(e.to_tool_result()),
+            }
+        } else {
+            let mut results = Vec::new();
+            for addr in addrs {
+                match self.worker.disasm(addr, count).await {
+                    Ok(text) => results.push(json!({
+                        "address": format!("{:#x}", addr),
+                        "disasm": text
+                    })),
+                    Err(e) => results.push(json!({
+                        "address": format!("{:#x}", addr),
+                        "error": e.to_string()
+                    })),
+                }
+            }
+            Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&json!({ "results": results }))
+                    .unwrap_or_else(|_| format!("{:?}", results)),
+            )]))
+        }
+    }
+
+    #[tool(description = "Get disassembly for a function by name")]
+    #[instrument(skip(self), fields(name = %req.name, count = req.count))]
+    async fn disasm_by_name(
+        &self,
+        Parameters(req): Parameters<DisasmByNameRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: disasm_by_name");
+        let count = req.count.unwrap_or(10).min(1000);
+
+        match self.worker.disasm_by_name(&req.name, count).await {
+            Ok(text) => Ok(CallToolResult::success(vec![Content::text(text)])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Decompile a function using Hex-Rays (if available)")]
+    #[instrument(skip(self), fields(address = %req.address))]
+    async fn decompile(
+        &self,
+        Parameters(req): Parameters<DecompileRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: decompile");
+        let addrs = match Self::value_to_addresses(&req.address) {
+            Ok(a) => a,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+
+        if addrs.len() == 1 {
+            match self.worker.decompile(addrs[0]).await {
+                Ok(code) => Ok(CallToolResult::success(vec![Content::text(code)])),
+                Err(e) => Ok(e.to_tool_result()),
+            }
+        } else {
+            let mut results = Vec::new();
+            for addr in addrs {
+                match self.worker.decompile(addr).await {
+                    Ok(code) => results.push(json!({
+                        "address": format!("{:#x}", addr),
+                        "decompile": code
+                    })),
+                    Err(e) => results.push(json!({
+                        "address": format!("{:#x}", addr),
+                        "error": e.to_string()
+                    })),
+                }
+            }
+            Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&json!({ "results": results }))
+                    .unwrap_or_else(|_| format!("{:?}", results)),
+            )]))
+        }
+    }
+
+    #[tool(
+        description = "Get decompiled pseudocode at a specific address or address range. \
+        Unlike 'decompile' which returns the full function, this returns only the statements \
+        that correspond to the given address(es). Useful for getting pseudocode for a basic block \
+        or specific instruction. If end_address is provided, returns statements covering the range."
+    )]
+    #[instrument(skip(self), fields(address = %req.address, end_address = ?req.end_address))]
+    async fn pseudocode_at(
+        &self,
+        Parameters(req): Parameters<PseudocodeAtRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: pseudocode_at");
+        let addrs = match Self::value_to_addresses(&req.address) {
+            Ok(a) => a,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+
+        let end_addr = if let Some(ref end_str) = req.end_address {
+            match Self::parse_address(end_str) {
+                Ok(a) => Some(a),
+                Err(e) => return Ok(e.to_tool_result()),
+            }
+        } else {
+            None
+        };
+
+        if addrs.len() == 1 {
+            match self.worker.pseudocode_at(addrs[0], end_addr).await {
+                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|_| format!("{:?}", result)),
+                )])),
+                Err(e) => Ok(e.to_tool_result()),
+            }
+        } else {
+            let mut results = Vec::new();
+            for addr in addrs {
+                match self.worker.pseudocode_at(addr, end_addr).await {
+                    Ok(result) => results.push(json!({
+                        "address": format!("{:#x}", addr),
+                        "pseudocode": result
+                    })),
+                    Err(e) => results.push(json!({
+                        "address": format!("{:#x}", addr),
+                        "error": e.to_string()
+                    })),
+                }
+            }
+            Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&json!({ "results": results }))
+                    .unwrap_or_else(|_| format!("{:?}", results)),
+            )]))
+        }
+    }
+
+    #[tool(description = "List all segments in the database with their permissions and types")]
+    #[instrument(skip(self))]
+    async fn segments(&self) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: segments");
+        match self.worker.segments().await {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(
+        description = "List strings in the database with pagination and optional filter. \
+        For large databases, consider setting timeout_secs (default: 120, max: 600)."
+    )]
+    #[instrument(skip(self), fields(offset = req.offset, limit = req.limit, filter = ?req.filter))]
+    async fn strings(
+        &self,
+        Parameters(req): Parameters<StringsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: strings");
+        let limit = req.limit.unwrap_or(100).min(10000);
+        let offset = req.offset.unwrap_or(0);
+
+        match self
+            .worker
+            .strings(offset, limit, req.filter, req.timeout_secs)
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Get cross-references TO an address (who references this address)")]
+    #[instrument(skip(self), fields(address = %req.address))]
+    async fn xrefs_to(
+        &self,
+        Parameters(req): Parameters<AddressRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: xrefs_to");
+        let addrs = match Self::value_to_addresses(&req.address) {
+            Ok(a) => a,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+
+        if addrs.len() == 1 {
+            match self.worker.xrefs_to(addrs[0]).await {
+                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|_| format!("{:?}", result)),
+                )])),
+                Err(e) => Ok(e.to_tool_result()),
+            }
+        } else {
+            let mut results = Vec::new();
+            for addr in addrs {
+                match self.worker.xrefs_to(addr).await {
+                    Ok(result) => results.push(json!({
+                        "address": format!("{:#x}", addr),
+                        "xrefs": result
+                    })),
+                    Err(e) => results.push(json!({
+                        "address": format!("{:#x}", addr),
+                        "error": e.to_string()
+                    })),
+                }
+            }
+            Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&json!({ "results": results }))
+                    .unwrap_or_else(|_| format!("{:?}", results)),
+            )]))
+        }
+    }
+
+    #[tool(description = "Get cross-references FROM an address (what this address references)")]
+    #[instrument(skip(self), fields(address = %req.address))]
+    async fn xrefs_from(
+        &self,
+        Parameters(req): Parameters<AddressRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: xrefs_from");
+        let addrs = match Self::value_to_addresses(&req.address) {
+            Ok(a) => a,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+
+        if addrs.len() == 1 {
+            match self.worker.xrefs_from(addrs[0]).await {
+                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|_| format!("{:?}", result)),
+                )])),
+                Err(e) => Ok(e.to_tool_result()),
+            }
+        } else {
+            let mut results = Vec::new();
+            for addr in addrs {
+                match self.worker.xrefs_from(addr).await {
+                    Ok(result) => results.push(json!({
+                        "address": format!("{:#x}", addr),
+                        "xrefs": result
+                    })),
+                    Err(e) => results.push(json!({
+                        "address": format!("{:#x}", addr),
+                        "error": e.to_string()
+                    })),
+                }
+            }
+            Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&json!({ "results": results }))
+                    .unwrap_or_else(|_| format!("{:?}", results)),
+            )]))
+        }
+    }
+
+    #[tool(description = "List imports (external symbols) with pagination")]
+    #[instrument(skip(self), fields(offset = req.offset, limit = req.limit))]
+    async fn imports(
+        &self,
+        Parameters(req): Parameters<PaginatedRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: imports");
+        let limit = req.limit.unwrap_or(100).min(10000);
+        let offset = req.offset.unwrap_or(0);
+
+        match self.worker.imports(offset, limit).await {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "List exports/names (public symbols) with pagination")]
+    #[instrument(skip(self), fields(offset = req.offset, limit = req.limit))]
+    async fn exports(
+        &self,
+        Parameters(req): Parameters<PaginatedRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: exports");
+        let limit = req.limit.unwrap_or(100).min(10000);
+        let offset = req.offset.unwrap_or(0);
+
+        match self.worker.exports(offset, limit).await {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Get entry point addresses of the binary")]
+    #[instrument(skip(self))]
+    async fn entrypoints(&self) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: entrypoints");
+        match self.worker.entrypoints().await {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Read raw bytes from an address as hex string")]
+    #[instrument(skip(self), fields(size = req.size))]
+    async fn get_bytes(
+        &self,
+        Parameters(req): Parameters<GetBytesRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: get_bytes");
+        let size = req.size.unwrap_or(256).min(0x10000);
+        if let Some(addr_value) = req.address.as_ref() {
+            let addrs = match Self::value_to_addresses(addr_value) {
+                Ok(a) => a,
+                Err(e) => return Ok(e.to_tool_result()),
+            };
+
+            if addrs.len() == 1 {
+                match self.worker.get_bytes(Some(addrs[0]), None, 0, size).await {
+                    Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                        serde_json::to_string_pretty(&result)
+                            .unwrap_or_else(|_| format!("{:?}", result)),
+                    )])),
+                    Err(e) => Ok(e.to_tool_result()),
+                }
+            } else {
+                let mut results = Vec::new();
+                for addr in addrs {
+                    match self.worker.get_bytes(Some(addr), None, 0, size).await {
+                        Ok(result) => results.push(json!({
+                            "address": format!("{:#x}", addr),
+                            "bytes": result
+                        })),
+                        Err(e) => results.push(json!({
+                            "address": format!("{:#x}", addr),
+                            "error": e.to_string()
+                        })),
+                    }
+                }
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&json!({ "results": results }))
+                        .unwrap_or_else(|_| format!("{:?}", results)),
+                )]))
+            }
+        } else if let Some(name) = req.target_name.as_ref() {
+            let offset = req.offset.unwrap_or(0);
+            match self
+                .worker
+                .get_bytes(None, Some(name.clone()), offset, size)
+                .await
+            {
+                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|_| format!("{:?}", result)),
+                )])),
+                Err(e) => Ok(e.to_tool_result()),
+            }
+        } else {
+            Ok(ToolError::InvalidParams("address or name required".to_string()).to_tool_result())
+        }
+    }
+
+    #[tool(description = "Get basic blocks of a function (control flow graph nodes)")]
+    #[instrument(skip(self), fields(address = %req.address))]
+    async fn basic_blocks(
+        &self,
+        Parameters(req): Parameters<AddressRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: basic_blocks");
+        let addrs = match Self::value_to_addresses(&req.address) {
+            Ok(a) => a,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+
+        if addrs.len() == 1 {
+            match self.worker.basic_blocks(addrs[0]).await {
+                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|_| format!("{:?}", result)),
+                )])),
+                Err(e) => Ok(e.to_tool_result()),
+            }
+        } else {
+            let mut results = Vec::new();
+            for addr in addrs {
+                match self.worker.basic_blocks(addr).await {
+                    Ok(result) => results.push(json!({
+                        "address": format!("{:#x}", addr),
+                        "basic_blocks": result
+                    })),
+                    Err(e) => results.push(json!({
+                        "address": format!("{:#x}", addr),
+                        "error": e.to_string()
+                    })),
+                }
+            }
+            Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&json!({ "results": results }))
+                    .unwrap_or_else(|_| format!("{:?}", results)),
+            )]))
+        }
+    }
+
+    #[tool(description = "Get functions called BY a function (callees/children in call graph)")]
+    #[instrument(skip(self), fields(address = %req.address))]
+    async fn callees(
+        &self,
+        Parameters(req): Parameters<AddressRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: callees");
+        let addrs = match Self::value_to_addresses(&req.address) {
+            Ok(a) => a,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+
+        if addrs.len() == 1 {
+            match self.worker.callees(addrs[0]).await {
+                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|_| format!("{:?}", result)),
+                )])),
+                Err(e) => Ok(e.to_tool_result()),
+            }
+        } else {
+            let mut results = Vec::new();
+            for addr in addrs {
+                match self.worker.callees(addr).await {
+                    Ok(result) => results.push(json!({
+                        "address": format!("{:#x}", addr),
+                        "callees": result
+                    })),
+                    Err(e) => results.push(json!({
+                        "address": format!("{:#x}", addr),
+                        "error": e.to_string()
+                    })),
+                }
+            }
+            Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&json!({ "results": results }))
+                    .unwrap_or_else(|_| format!("{:?}", results)),
+            )]))
+        }
+    }
+
+    #[tool(description = "Get functions that CALL a function (callers/parents in call graph)")]
+    #[instrument(skip(self), fields(address = %req.address))]
+    async fn callers(
+        &self,
+        Parameters(req): Parameters<AddressRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: callers");
+        let addrs = match Self::value_to_addresses(&req.address) {
+            Ok(a) => a,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+
+        if addrs.len() == 1 {
+            match self.worker.callers(addrs[0]).await {
+                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|_| format!("{:?}", result)),
+                )])),
+                Err(e) => Ok(e.to_tool_result()),
+            }
+        } else {
+            let mut results = Vec::new();
+            for addr in addrs {
+                match self.worker.callers(addr).await {
+                    Ok(result) => results.push(json!({
+                        "address": format!("{:#x}", addr),
+                        "callers": result
+                    })),
+                    Err(e) => results.push(json!({
+                        "address": format!("{:#x}", addr),
+                        "error": e.to_string()
+                    })),
+                }
+            }
+            Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&json!({ "results": results }))
+                    .unwrap_or_else(|_| format!("{:?}", results)),
+            )]))
+        }
+    }
+
+    #[tool(description = "Get IDB metadata (ida-pro-mcp compatibility)")]
+    #[instrument(skip(self))]
+    async fn idb_meta(&self) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: idb_meta");
+        match self.worker.idb_meta().await {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Lookup functions by name or address (batch)")]
+    #[instrument(skip(self))]
+    async fn lookup_funcs(
+        &self,
+        Parameters(req): Parameters<LookupFuncsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: lookup_funcs");
+        let queries = match Self::value_to_strings(&req.queries) {
+            Ok(v) => v,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+        match self.worker.lookup_funcs(queries).await {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "List global names (non-function symbols). \
+        For large databases, consider setting timeout_secs (default: 120, max: 600).")]
+    #[instrument(skip(self), fields(offset = req.offset, limit = req.limit, query = ?req.query))]
+    async fn list_globals(
+        &self,
+        Parameters(req): Parameters<ListGlobalsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: list_globals");
+        let limit = req.limit.unwrap_or(100).min(10000);
+        let offset = req.offset.unwrap_or(0);
+        match self
+            .worker
+            .list_globals(req.query.clone(), offset, limit, req.timeout_secs)
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(
+        description = "Analyze strings with xrefs (ida-pro-mcp compatibility). \
+        For large databases, consider setting timeout_secs (default: 120, max: 600)."
+    )]
+    #[instrument(skip(self), fields(offset = req.offset, limit = req.limit, query = ?req.query))]
+    async fn analyze_strings(
+        &self,
+        Parameters(req): Parameters<AnalyzeStringsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: analyze_strings");
+        let limit = req.limit.unwrap_or(100).min(10000);
+        let offset = req.offset.unwrap_or(0);
+        match self
+            .worker
+            .analyze_strings(req.query.clone(), offset, limit, req.timeout_secs)
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Find byte patterns (ida-pro-mcp compatibility). \
+        For large databases, consider setting timeout_secs (default: 120, max: 600).")]
+    #[instrument(skip(self))]
+    async fn find_bytes(
+        &self,
+        Parameters(req): Parameters<FindBytesRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: find_bytes");
+        let patterns = match Self::value_to_strings(&req.patterns) {
+            Ok(v) => v,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+        let limit = req.limit.unwrap_or(100).min(10000);
+        let offset = req.offset.unwrap_or(0);
+        let timeout_secs = req.timeout_secs;
+        let mut results = Vec::new();
+
+        for pattern in patterns {
+            let max_results = (offset + limit).min(20000);
+            match self
+                .worker
+                .find_bytes(pattern.clone(), max_results, timeout_secs)
+                .await
+            {
+                Ok(value) => {
+                    let matches = value
+                        .get("matches")
+                        .and_then(|m| m.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    let total = matches.len();
+                    let sliced = matches
+                        .into_iter()
+                        .skip(offset)
+                        .take(limit)
+                        .collect::<Vec<_>>();
+                    let next_offset = if offset + limit < total {
+                        Some(offset + limit)
+                    } else {
+                        None
+                    };
+                    results.push(json!({
+                        "pattern": pattern,
+                        "matches": sliced,
+                        "total": total,
+                        "next_offset": next_offset
+                    }));
+                }
+                Err(e) => results.push(json!({
+                    "pattern": pattern,
+                    "error": e.to_string()
+                })),
+            }
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&json!({ "results": results }))
+                .unwrap_or_else(|_| format!("{:?}", results)),
+        )]))
+    }
+
+    #[tool(
+        description = "Search for text or immediates (ida-pro-mcp compatibility). \
+        For large databases, consider setting timeout_secs (default: 120, max: 600)."
+    )]
+    #[instrument(skip(self))]
+    async fn search(
+        &self,
+        Parameters(req): Parameters<SearchRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: search");
+        let targets = match Self::value_to_strings(&req.targets) {
+            Ok(v) => v,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+        let limit = req.limit.unwrap_or(100).min(10000);
+        let offset = req.offset.unwrap_or(0);
+        let timeout_secs = req.timeout_secs;
+        let kind = req.kind.as_deref().unwrap_or("auto").to_lowercase();
+
+        let mut results = Vec::new();
+        for target in targets {
+            let max_results = (offset + limit).min(20000);
+            let search_result = if kind == "imm" || kind == "immediate" {
+                match Self::parse_address(&target) {
+                    Ok(val) => self.worker.search_imm(val, max_results, timeout_secs).await,
+                    Err(e) => {
+                        results.push(json!({
+                            "target": target,
+                            "error": e.to_string()
+                        }));
+                        continue;
+                    }
+                }
+            } else if kind == "text" || kind == "string" {
+                self.worker
+                    .search_text(target.clone(), max_results, timeout_secs)
+                    .await
+            } else if let Ok(val) = Self::parse_address(&target) {
+                self.worker.search_imm(val, max_results, timeout_secs).await
+            } else {
+                self.worker
+                    .search_text(target.clone(), max_results, timeout_secs)
+                    .await
+            };
+
+            match search_result {
+                Ok(value) => {
+                    let matches = value
+                        .get("matches")
+                        .and_then(|m| m.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    let total = matches.len();
+                    let sliced = matches
+                        .into_iter()
+                        .skip(offset)
+                        .take(limit)
+                        .collect::<Vec<_>>();
+                    let next_offset = if offset + limit < total {
+                        Some(offset + limit)
+                    } else {
+                        None
+                    };
+                    results.push(json!({
+                        "target": target,
+                        "matches": sliced,
+                        "total": total,
+                        "next_offset": next_offset
+                    }));
+                }
+                Err(e) => results.push(json!({
+                    "target": target,
+                    "error": e.to_string()
+                })),
+            }
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&json!({ "results": results }))
+                .unwrap_or_else(|_| format!("{:?}", results)),
+        )]))
+    }
+
+    #[tool(description = "Read u8 values at address(es)")]
+    #[instrument(skip(self))]
+    async fn get_u8(
+        &self,
+        Parameters(req): Parameters<AddressRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        get_int_values(&self.worker, req.address, 1).await
+    }
+
+    #[tool(description = "Read u16 values at address(es)")]
+    #[instrument(skip(self))]
+    async fn get_u16(
+        &self,
+        Parameters(req): Parameters<AddressRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        get_int_values(&self.worker, req.address, 2).await
+    }
+
+    #[tool(description = "Read u32 values at address(es)")]
+    #[instrument(skip(self))]
+    async fn get_u32(
+        &self,
+        Parameters(req): Parameters<AddressRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        get_int_values(&self.worker, req.address, 4).await
+    }
+
+    #[tool(description = "Read u64 values at address(es)")]
+    #[instrument(skip(self))]
+    async fn get_u64(
+        &self,
+        Parameters(req): Parameters<AddressRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        get_int_values(&self.worker, req.address, 8).await
+    }
+
+    #[tool(description = "Read string(s) at address(es)")]
+    #[instrument(skip(self))]
+    async fn get_string(
+        &self,
+        Parameters(req): Parameters<GetStringRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: get_string");
+        let addrs = match Self::value_to_addresses(&req.address) {
+            Ok(v) => v,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+        let max_len = req.max_len.unwrap_or(256).min(0x10000);
+
+        if addrs.len() == 1 {
+            match self.worker.get_string(addrs[0], max_len).await {
+                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|_| format!("{:?}", result)),
+                )])),
+                Err(e) => Ok(e.to_tool_result()),
+            }
+        } else {
+            let mut results = Vec::new();
+            for addr in addrs {
+                match self.worker.get_string(addr, max_len).await {
+                    Ok(result) => results.push(json!({
+                        "address": format!("{:#x}", addr),
+                        "string": result
+                    })),
+                    Err(e) => results.push(json!({
+                        "address": format!("{:#x}", addr),
+                        "error": e.to_string()
+                    })),
+                }
+            }
+            Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&json!({ "results": results }))
+                    .unwrap_or_else(|_| format!("{:?}", results)),
+            )]))
+        }
+    }
+
+    #[tool(description = "Get global value(s) by name or address")]
+    #[instrument(skip(self))]
+    async fn get_global_value(
+        &self,
+        Parameters(req): Parameters<GetGlobalValueRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: get_global_value");
+        let queries = match Self::value_to_strings(&req.query) {
+            Ok(v) => v,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+
+        if queries.len() == 1 {
+            match self.worker.get_global_value(queries[0].clone()).await {
+                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|_| format!("{:?}", result)),
+                )])),
+                Err(e) => Ok(e.to_tool_result()),
+            }
+        } else {
+            let mut results = Vec::new();
+            for query in queries {
+                match self.worker.get_global_value(query.clone()).await {
+                    Ok(result) => results.push(json!({
+                        "query": query,
+                        "value": result
+                    })),
+                    Err(e) => results.push(json!({
+                        "query": query,
+                        "error": e.to_string()
+                    })),
+                }
+            }
+            Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&json!({ "results": results }))
+                    .unwrap_or_else(|_| format!("{:?}", results)),
+            )]))
+        }
+    }
+
+    #[tool(description = "Find paths between two addresses (CFG)")]
+    #[instrument(skip(self))]
+    async fn find_paths(
+        &self,
+        Parameters(req): Parameters<FindPathsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: find_paths");
+        let start = match Self::value_to_single_address(&req.start) {
+            Ok(v) => v,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+        let end = match Self::value_to_single_address(&req.end) {
+            Ok(v) => v,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+        let max_paths = req.max_paths.unwrap_or(8).min(128);
+        let max_depth = req.max_depth.unwrap_or(64).min(2048);
+
+        match self
+            .worker
+            .find_paths(start, end, max_paths, max_depth)
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Build a callgraph rooted at an address")]
+    #[instrument(skip(self))]
+    async fn callgraph(
+        &self,
+        Parameters(req): Parameters<CallGraphRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: callgraph");
+        let roots = match Self::value_to_addresses(&req.roots) {
+            Ok(v) => v,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+        let max_depth = req.max_depth.unwrap_or(2).min(16);
+        let max_nodes = req.max_nodes.unwrap_or(256).min(10000);
+
+        if roots.len() == 1 {
+            match self.worker.callgraph(roots[0], max_depth, max_nodes).await {
+                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|_| format!("{:?}", result)),
+                )])),
+                Err(e) => Ok(e.to_tool_result()),
+            }
+        } else {
+            let mut results = Vec::new();
+            for root in roots {
+                match self.worker.callgraph(root, max_depth, max_nodes).await {
+                    Ok(result) => results.push(json!({
+                        "root": format!("{:#x}", root),
+                        "callgraph": result
+                    })),
+                    Err(e) => results.push(json!({
+                        "root": format!("{:#x}", root),
+                        "error": e.to_string()
+                    })),
+                }
+            }
+            Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&json!({ "results": results }))
+                    .unwrap_or_else(|_| format!("{:?}", results)),
+            )]))
+        }
+    }
+
+    #[tool(description = "Compute xref matrix for a set of addresses")]
+    #[instrument(skip(self))]
+    async fn xref_matrix(
+        &self,
+        Parameters(req): Parameters<XrefMatrixRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: xref_matrix");
+        let addrs = match Self::value_to_addresses(&req.addrs) {
+            Ok(v) => v,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+        match self.worker.xref_matrix(addrs).await {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Export functions (ida-pro-mcp compatibility)")]
+    #[instrument(skip(self), fields(offset = req.offset, limit = req.limit))]
+    async fn export_funcs(
+        &self,
+        Parameters(req): Parameters<ExportFuncsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: export_funcs");
+        if let Some(fmt) = req.format.as_deref() {
+            if fmt.to_lowercase() != "json" {
+                return Ok(ToolError::NotSupported(format!(
+                    "format {} not supported (only json)",
+                    fmt
+                ))
+                .to_tool_result());
+            }
+        }
+        if let Some(addrs) = req.addrs {
+            let queries = match Self::value_to_strings(&addrs) {
+                Ok(v) => v,
+                Err(e) => return Ok(e.to_tool_result()),
+            };
+            match self.worker.lookup_funcs(queries).await {
+                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|_| format!("{:?}", result)),
+                )])),
+                Err(e) => Ok(e.to_tool_result()),
+            }
+        } else {
+            let limit = req.limit.unwrap_or(100).min(10000);
+            let offset = req.offset.unwrap_or(0);
+            match self.worker.export_funcs(offset, limit).await {
+                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|_| format!("{:?}", result)),
+                )])),
+                Err(e) => Ok(e.to_tool_result()),
+            }
+        }
+    }
+
+    #[tool(description = "Convert integers between bases")]
+    #[instrument(skip(self))]
+    async fn int_convert(
+        &self,
+        Parameters(req): Parameters<IntConvertRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: int_convert");
+        let inputs = match Self::value_to_strings(&req.inputs) {
+            Ok(v) => v,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+
+        let mut results = Vec::new();
+        for input in inputs {
+            match Self::parse_address(&input) {
+                Ok(value) => {
+                    let le = value.to_le_bytes();
+                    let be = value.to_be_bytes();
+                    let le_trim = trim_bytes_le(&le);
+                    let be_trim = trim_bytes_be(&be);
+                    results.push(json!({
+                        "input": input,
+                        "value": value,
+                        "dec": value.to_string(),
+                        "hex": format!("0x{:x}", value),
+                        "bin": format!("0b{:b}", value),
+                        "bytes_le": hex_encode(&le_trim),
+                        "bytes_be": hex_encode(&be_trim),
+                        "ascii": bytes_to_ascii(&le_trim),
+                    }));
+                }
+                Err(e) => results.push(json!({
+                    "input": input,
+                    "error": e.to_string()
+                })),
+            }
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&json!({ "results": results }))
+                .unwrap_or_else(|_| format!("{:?}", results)),
+        )]))
+    }
+
+    #[tool(description = "List local types")]
+    async fn local_types(
+        &self,
+        Parameters(req): Parameters<LocalTypesRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let offset = req.offset.unwrap_or(0);
+        let limit = req.limit.unwrap_or(100);
+        match self
+            .worker
+            .local_types(offset, limit, req.filter.clone(), req.timeout_secs)
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Get xrefs to a struct field")]
+    async fn xrefs_to_field(
+        &self,
+        Parameters(req): Parameters<XrefsToFieldRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = req.limit.unwrap_or(1000).min(10000);
+        match self
+            .worker
+            .xrefs_to_field(
+                req.ordinal,
+                req.name.clone(),
+                req.member_index,
+                req.member_name.clone(),
+                limit,
+            )
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Set comments at an address")]
+    async fn set_comments(
+        &self,
+        Parameters(req): Parameters<SetCommentsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let repeatable = req.repeatable.unwrap_or(false);
+        let offset = req.offset.unwrap_or(0);
+        let addr = match req.address.as_ref() {
+            Some(val) => match Self::value_to_single_address(val) {
+                Ok(v) => Some(v),
+                Err(e) => return Ok(e.to_tool_result()),
+            },
+            None => None,
+        };
+        match self
+            .worker
+            .set_comments(
+                addr,
+                req.target_name.clone(),
+                offset,
+                req.comment.clone(),
+                repeatable,
+            )
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Patch instructions with assembly text")]
+    async fn patch_asm(
+        &self,
+        Parameters(req): Parameters<PatchAsmRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let offset = req.offset.unwrap_or(0);
+        let addr = match req.address.as_ref() {
+            Some(val) => match Self::value_to_single_address(val) {
+                Ok(v) => Some(v),
+                Err(e) => return Ok(e.to_tool_result()),
+            },
+            None => None,
+        };
+        match self
+            .worker
+            .patch_asm(addr, req.target_name.clone(), offset, req.line.clone())
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Declare a type in the local type library")]
+    async fn declare_type(
+        &self,
+        Parameters(req): Parameters<DeclareTypeRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let relaxed = req.relaxed.unwrap_or(false);
+        let replace = req.replace.unwrap_or(false);
+        let multi = req.multi.unwrap_or(false);
+        match self
+            .worker
+            .declare_type(req.decl.clone(), relaxed, replace, multi)
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Get stack frame info")]
+    async fn stack_frame(
+        &self,
+        Parameters(req): Parameters<AddressRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let addr = match Self::value_to_single_address(&req.address) {
+            Ok(addr) => addr,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+        match self.worker.stack_frame(addr).await {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Declare a stack variable in a function frame")]
+    async fn declare_stack(
+        &self,
+        Parameters(req): Parameters<DeclareStackRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let addr = match req.address.as_ref() {
+            Some(val) => match Self::value_to_single_address(val) {
+                Ok(v) => Some(v),
+                Err(e) => return Ok(e.to_tool_result()),
+            },
+            None => None,
+        };
+        let relaxed = req.relaxed.unwrap_or(false);
+        match self
+            .worker
+            .declare_stack(
+                addr,
+                req.target_name.clone(),
+                req.offset,
+                req.var_name.clone(),
+                req.decl.clone(),
+                relaxed,
+            )
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Delete a stack variable from a function frame")]
+    async fn delete_stack(
+        &self,
+        Parameters(req): Parameters<DeleteStackRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let addr = match req.address.as_ref() {
+            Some(val) => match Self::value_to_single_address(val) {
+                Ok(v) => Some(v),
+                Err(e) => return Ok(e.to_tool_result()),
+            },
+            None => None,
+        };
+        match self
+            .worker
+            .delete_stack(
+                addr,
+                req.target_name.clone(),
+                req.offset,
+                req.var_name.clone(),
+            )
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(
+        description = "List structs in the database with pagination and optional filter. \
+        For large databases, consider setting timeout_secs (default: 120, max: 600)."
+    )]
+    #[instrument(skip(self), fields(offset = req.offset, limit = req.limit, filter = ?req.filter))]
+    async fn structs(
+        &self,
+        Parameters(req): Parameters<StructsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: structs");
+        let limit = req.limit.unwrap_or(100).min(10000);
+        let offset = req.offset.unwrap_or(0);
+
+        match self
+            .worker
+            .structs(offset, limit, req.filter, req.timeout_secs)
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Get info about a struct by ordinal or name")]
+    #[instrument(skip(self), fields(ordinal = req.ordinal, name = ?req.name))]
+    async fn struct_info(
+        &self,
+        Parameters(req): Parameters<StructInfoRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: struct_info");
+        match self.worker.struct_info(req.ordinal, req.name).await {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Read values of a struct instance at an address")]
+    #[instrument(skip(self), fields(address = %req.address, ordinal = req.ordinal, name = ?req.name))]
+    async fn read_struct(
+        &self,
+        Parameters(req): Parameters<ReadStructRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: read_struct");
+        let addrs = match Self::value_to_addresses(&req.address) {
+            Ok(a) => a,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+
+        if addrs.len() == 1 {
+            match self
+                .worker
+                .read_struct(addrs[0], req.ordinal, req.name)
+                .await
+            {
+                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|_| format!("{:?}", result)),
+                )])),
+                Err(e) => Ok(e.to_tool_result()),
+            }
+        } else {
+            let mut results = Vec::new();
+            for addr in addrs {
+                match self
+                    .worker
+                    .read_struct(addr, req.ordinal, req.name.clone())
+                    .await
+                {
+                    Ok(result) => results.push(json!({
+                        "address": format!("{:#x}", addr),
+                        "struct": result
+                    })),
+                    Err(e) => results.push(json!({
+                        "address": format!("{:#x}", addr),
+                        "error": e.to_string()
+                    })),
+                }
+            }
+            Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&json!({ "results": results }))
+                    .unwrap_or_else(|_| format!("{:?}", results)),
+            )]))
+        }
+    }
+
+    #[tool(description = "Search structs by name")]
+    async fn search_structs(
+        &self,
+        Parameters(req): Parameters<StructsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let offset = req.offset.unwrap_or(0);
+        let limit = req.limit.unwrap_or(100);
+        match self
+            .worker
+            .structs(offset, limit, req.filter.clone(), req.timeout_secs)
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Find instruction sequences by mnemonic")]
+    async fn find_insns(
+        &self,
+        Parameters(req): Parameters<FindInsnsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let patterns = match Self::value_to_strings(&req.patterns) {
+            Ok(v) => v,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+        if patterns.is_empty() {
+            return Ok(ToolError::InvalidParams("empty patterns".to_string()).to_tool_result());
+        }
+        let max_results = req.limit.unwrap_or(100);
+        let case_insensitive = req.case_insensitive.unwrap_or(false);
+        match self
+            .worker
+            .find_insns(patterns, max_results, case_insensitive, req.timeout_secs)
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Find instruction operands")]
+    async fn find_insn_operands(
+        &self,
+        Parameters(req): Parameters<FindInsnOperandsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let patterns = match Self::value_to_strings(&req.patterns) {
+            Ok(v) => v,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+        if patterns.is_empty() {
+            return Ok(ToolError::InvalidParams("empty patterns".to_string()).to_tool_result());
+        }
+        let max_results = req.limit.unwrap_or(100);
+        let case_insensitive = req.case_insensitive.unwrap_or(false);
+        match self
+            .worker
+            .find_insn_operands(patterns, max_results, case_insensitive, req.timeout_secs)
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Apply a type to an address")]
+    async fn apply_types(
+        &self,
+        Parameters(req): Parameters<ApplyTypesRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let addr = match req.address.as_ref() {
+            Some(val) => match Self::value_to_single_address(val) {
+                Ok(v) => Some(v),
+                Err(e) => return Ok(e.to_tool_result()),
+            },
+            None => None,
+        };
+        let offset = req.offset.unwrap_or(0);
+        let relaxed = req.relaxed.unwrap_or(false);
+        let delay = req.delay.unwrap_or(false);
+        let strict = req.strict.unwrap_or(false);
+        match self
+            .worker
+            .apply_types(
+                addr,
+                req.target_name.clone(),
+                offset,
+                req.stack_offset,
+                req.stack_name.clone(),
+                req.decl.clone(),
+                req.type_name.clone(),
+                relaxed,
+                delay,
+                strict,
+            )
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Infer/guess type at an address")]
+    async fn infer_types(
+        &self,
+        Parameters(req): Parameters<InferTypesRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let addr = match req.address.as_ref() {
+            Some(val) => match Self::value_to_single_address(val) {
+                Ok(v) => Some(v),
+                Err(e) => return Ok(e.to_tool_result()),
+            },
+            None => None,
+        };
+        let offset = req.offset.unwrap_or(0);
+        match self
+            .worker
+            .infer_types(addr, req.target_name.clone(), offset)
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Analyze functions (not supported)")]
+    async fn analyze_funcs(
+        &self,
+        Parameters(req): Parameters<AnalyzeFuncsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.worker.analyze_funcs(req.timeout_secs).await {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Rename symbols")]
+    async fn rename(
+        &self,
+        Parameters(req): Parameters<RenameRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let addr = match req.address.as_ref() {
+            Some(val) => match Self::value_to_single_address(val) {
+                Ok(v) => Some(v),
+                Err(e) => return Ok(e.to_tool_result()),
+            },
+            None => None,
+        };
+        let flags = req.flags.unwrap_or(0);
+        match self
+            .worker
+            .rename(addr, req.current_name.clone(), req.name.clone(), flags)
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Patch bytes at an address")]
+    async fn patch(
+        &self,
+        Parameters(req): Parameters<PatchRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let addr = match req.address.as_ref() {
+            Some(val) => match Self::value_to_single_address(val) {
+                Ok(v) => Some(v),
+                Err(e) => return Ok(e.to_tool_result()),
+            },
+            None => None,
+        };
+        let offset = req.offset.unwrap_or(0);
+        let bytes = match Self::value_to_bytes(&req.bytes) {
+            Ok(v) => v,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+        match self
+            .worker
+            .patch_bytes(addr, req.target_name.clone(), offset, bytes)
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+}
+
+async fn get_int_values(
+    worker: &IdaWorker,
+    address: Value,
+    size: usize,
+) -> Result<CallToolResult, McpError> {
+    let addrs = match IdaMcpServer::value_to_addresses(&address) {
+        Ok(v) => v,
+        Err(e) => return Ok(e.to_tool_result()),
+    };
+
+    if addrs.len() == 1 {
+        match worker.read_int(addrs[0], size).await {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    } else {
+        let mut results = Vec::new();
+        for addr in addrs {
+            match worker.read_int(addr, size).await {
+                Ok(result) => results.push(json!({
+                    "address": format!("{:#x}", addr),
+                    "value": result
+                })),
+                Err(e) => results.push(json!({
+                    "address": format!("{:#x}", addr),
+                    "error": e.to_string()
+                })),
+            }
+        }
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&json!({ "results": results }))
+                .unwrap_or_else(|_| format!("{:?}", results)),
+        )]))
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn trim_bytes_le(bytes: &[u8]) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    while out.len() > 1 && out.last() == Some(&0) {
+        out.pop();
+    }
+    out
+}
+
+fn trim_bytes_be(bytes: &[u8]) -> Vec<u8> {
+    let mut start = 0usize;
+    while start + 1 < bytes.len() && bytes[start] == 0 {
+        start += 1;
+    }
+    bytes[start..].to_vec()
+}
+
+fn bytes_to_ascii(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| {
+            let c = *b as char;
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '.'
+            }
+        })
+        .collect()
+}
+
+fn tool_params_schema(name: &str) -> Option<Value> {
+    fn schema<T: JsonSchema>() -> Value {
+        serde_json::to_value(schema_for!(T)).unwrap_or_else(|_| json!({}))
+    }
+
+    match name {
+        // Core
+        "open_idb" => Some(schema::<OpenIdbRequest>()),
+        "close_idb" => Some(schema::<EmptyParams>()),
+        "load_debug_info" => Some(schema::<LoadDebugInfoRequest>()),
+        "tool_catalog" => Some(schema::<ToolCatalogRequest>()),
+        "tool_help" => Some(schema::<ToolHelpRequest>()),
+        "enable_tools" => Some(schema::<EnableToolsRequest>()),
+        "idb_meta" => Some(schema::<EmptyParams>()),
+
+        // Functions
+        "list_functions" | "list_funcs" => Some(schema::<ListFunctionsRequest>()),
+        "resolve_function" => Some(schema::<ResolveFunctionRequest>()),
+        "lookup_funcs" => Some(schema::<LookupFuncsRequest>()),
+        "analyze_funcs" => Some(schema::<AnalyzeFuncsRequest>()),
+
+        // Disassembly / Decompile
+        "disasm" => Some(schema::<DisasmRequest>()),
+        "disasm_by_name" => Some(schema::<DisasmByNameRequest>()),
+        "decompile" => Some(schema::<DecompileRequest>()),
+        "pseudocode_at" => Some(schema::<PseudocodeAtRequest>()),
+
+        // Xrefs / Control flow
+        "xrefs_to" | "xrefs_from" => Some(schema::<AddressRequest>()),
+        "xref_matrix" => Some(schema::<XrefMatrixRequest>()),
+        "basic_blocks" | "callers" | "callees" => Some(schema::<AddressRequest>()),
+        "find_paths" => Some(schema::<FindPathsRequest>()),
+        "callgraph" => Some(schema::<CallGraphRequest>()),
+
+        // Memory / Search / Metadata
+        "get_bytes" => Some(schema::<GetBytesRequest>()),
+        "get_string" => Some(schema::<GetStringRequest>()),
+        "get_u8" | "get_u16" | "get_u32" | "get_u64" => Some(schema::<AddressRequest>()),
+        "get_global_value" => Some(schema::<GetGlobalValueRequest>()),
+        "strings" => Some(schema::<StringsRequest>()),
+        "analyze_strings" => Some(schema::<AnalyzeStringsRequest>()),
+        "find_bytes" => Some(schema::<FindBytesRequest>()),
+        "search" => Some(schema::<SearchRequest>()),
+        "find_insns" => Some(schema::<FindInsnsRequest>()),
+        "find_insn_operands" => Some(schema::<FindInsnOperandsRequest>()),
+        "segments" => Some(schema::<EmptyParams>()),
+        "imports" | "exports" => Some(schema::<PaginatedRequest>()),
+        "export_funcs" => Some(schema::<ExportFuncsRequest>()),
+        "entrypoints" => Some(schema::<EmptyParams>()),
+        "list_globals" => Some(schema::<ListGlobalsRequest>()),
+        "int_convert" => Some(schema::<IntConvertRequest>()),
+
+        // Editing
+        "set_comments" => Some(schema::<SetCommentsRequest>()),
+        "rename" => Some(schema::<RenameRequest>()),
+        "patch" => Some(schema::<PatchRequest>()),
+        "patch_asm" => Some(schema::<PatchAsmRequest>()),
+
+        // Types
+        "structs" => Some(schema::<StructsRequest>()),
+        "struct_info" => Some(schema::<StructInfoRequest>()),
+        "read_struct" => Some(schema::<ReadStructRequest>()),
+        "search_structs" => Some(schema::<StructsRequest>()),
+        "local_types" => Some(schema::<LocalTypesRequest>()),
+        "xrefs_to_field" => Some(schema::<XrefsToFieldRequest>()),
+        "stack_frame" => Some(schema::<AddressRequest>()),
+        "declare_type" => Some(schema::<DeclareTypeRequest>()),
+        "apply_types" => Some(schema::<ApplyTypesRequest>()),
+        "infer_types" => Some(schema::<InferTypesRequest>()),
+        "declare_stack" => Some(schema::<DeclareStackRequest>()),
+        "delete_stack" => Some(schema::<DeleteStackRequest>()),
+
+        _ => None,
+    }
+}
+
+#[tool_handler(router = self.tool_mux)]
+impl ServerHandler for IdaMcpServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo {
+            capabilities: ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .build(),
+            instructions: Some(
+                "IDA Pro headless analysis server for reverse engineering binaries. \
+                 \n\nWorkflow: \
+                 \n1. open_idb: Open a .i64/.idb file or a raw binary (Mach-O/ELF/PE). Large DBs may take 30+ seconds. \
+                 \n   load_debug_info: Optional for existing .i64 to load DWARF/dSYM \
+                 \n2. tool_catalog: Discover tools for your task (e.g., 'find callers', 'decompile') \
+                 \n3. tool_help: Get full docs for a specific tool \
+                 \n4. Use the discovered tools to analyze the binary \
+                 \n5. close_idb: Optionally close when done \
+                 \n\nNote: tools/list is intentionally minimal; use tool_catalog to discover the full tool set, \
+                 and enable_tools to expand tools/list. \
+                 \n\nTool Categories: \
+                 \n- core: open/close/discover (open_idb, close_idb, tool_catalog, tool_help, enable_tools, idb_meta) \
+                 \n- functions: list, resolve, lookup functions \
+                 \n- disassembly: disasm at addresses \
+                 \n- decompile: Hex-Rays pseudocode \
+                 \n- xrefs: cross-reference analysis \
+                 \n- control_flow: CFG, callgraph, paths \
+                 \n- memory: read bytes, strings, values \
+                 \n- search: find patterns, strings \
+                 \n- metadata: segments, imports, exports \
+                 \n- types: declare_type, apply_types (addr/stack), infer_types, local_types, stack_frame, declare_stack, delete_stack, structs (list/info/read) \
+                \n- editing: comments/rename/patch/patch_asm \
+                 \n\nTip: Use tool_catalog(query='what you want to do') to find the right tool."
+                    .to_string(),
+            ),
+            ..Default::default()
+        }
+    }
+}
