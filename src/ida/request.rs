@@ -12,6 +12,7 @@ pub enum IdaRequest {
         load_debug_info: bool,
         debug_info_path: Option<String>,
         debug_info_verbose: bool,
+        force: bool,
         resp: oneshot::Sender<Result<DbInfo, ToolError>>,
     },
     Close {

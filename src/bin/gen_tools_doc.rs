@@ -73,6 +73,10 @@ fn main() {
         out,
         "- `tool_help(name=...)` returns full documentation and schema"
     );
+    let _ = writeln!(
+        out,
+        "- Call `close_idb` when done to release locks; in multi-client servers coordinate before closing (HTTP/SSE requires close_token from open_idb)"
+    );
     let _ = writeln!(out);
 
     let _ = writeln!(

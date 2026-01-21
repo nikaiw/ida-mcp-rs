@@ -14,7 +14,10 @@ use hyper::http::{header::ORIGIN, Request, Response, StatusCode};
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
-use ida_mcp::{disasm::generate_disasm_line, ida, DbInfo, FunctionInfo, IdaMcpServer, IdaWorker};
+use ida_mcp::{
+    disasm::generate_disasm_line, expand_path, ida, DbInfo, FunctionInfo, IdaMcpServer, IdaWorker,
+    ServerMode,
+};
 use idalib::{idb::IDBOpenOptions, Address, IDB};
 use rmcp::transport::stdio;
 use rmcp::transport::streamable_http_server::{
@@ -28,9 +31,12 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 use tower_service::Service;
 use tracing::{error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+const REQUEST_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Parser)]
 #[command(name = "ida-mcp", version, about = "Headless IDA Pro MCP Server")]
@@ -216,7 +222,7 @@ fn run_server() -> anyhow::Result<()> {
     init_ida()?;
 
     // Create channel for IDA requests
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
     let worker = IdaWorker::new(tx);
 
     // Spawn background thread for tokio runtime and MCP server
@@ -231,22 +237,46 @@ fn run_server() -> anyhow::Result<()> {
 
         rt.block_on(async move {
             info!("MCP server listening on stdio");
-            let server = IdaMcpServer::new(Arc::new(worker_for_server));
-            let service = server.serve(stdio()).await?;
-            let cancel = service.cancellation_token();
+            let server = IdaMcpServer::new(Arc::new(worker_for_server), ServerMode::Stdio);
+            let mut service = Some(server.serve(stdio()).await?);
+            let shutdown_notify = Arc::new(Notify::new());
+            let shutdown_signal = shutdown_notify.clone();
+
             let shutdown_worker = worker_for_shutdown.clone();
             tokio::spawn(async move {
                 if wait_for_shutdown_signal().await.is_ok() {
                     info!("Shutdown signal received");
-                    let _ = shutdown_worker.close().await;
-                    let _ = shutdown_worker.shutdown();
-                    cancel.cancel();
+                    let _ = shutdown_worker.close_for_shutdown().await;
+                    let _ = shutdown_worker.shutdown().await;
+                    shutdown_signal.notify_one();
+                } else {
+                    info!("Shutdown signal handler failed; server will continue running");
                 }
             });
-            service.waiting().await?;
+
+            loop {
+                tokio::select! {
+                    _ = shutdown_notify.notified() => {
+                        if let Some(mut running) = service.take() {
+                            let _ = running.close().await?;
+                        }
+                        break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                        if let Some(running) = service.as_ref() {
+                            if running.is_transport_closed() {
+                                if let Some(running) = service.take() {
+                                    let _ = running.waiting().await?;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
             info!("MCP server shutting down");
-            let _ = worker_for_shutdown.close().await;
-            let _ = worker_for_shutdown.shutdown();
+            let _ = worker_for_shutdown.close_for_shutdown().await;
+            let _ = worker_for_shutdown.shutdown().await;
             Ok::<_, anyhow::Error>(())
         })
     });
@@ -275,18 +305,19 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid bind address: {e}"))?;
 
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
     let worker = Arc::new(IdaWorker::new(tx));
 
     let worker_for_factory = worker.clone();
     let worker_for_shutdown = worker.clone();
-    let server_handle = thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create tokio runtime");
+    let server_handle =
+        thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime");
 
-        let result = rt.block_on(async move {
+            let result = rt.block_on(async move {
             let session_manager = Arc::new(LocalSessionManager::default());
             let cancel = tokio_util::sync::CancellationToken::new();
             let cancel_for_config = cancel.clone();
@@ -296,12 +327,13 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
                 } else {
                     Some(Duration::from_secs(args.sse_keep_alive_secs))
                 },
+                sse_retry: None,
                 stateful_mode: !args.stateless,
                 cancellation_token: cancel_for_config,
             };
 
             let service = StreamableHttpService::new(
-                move || Ok(IdaMcpServer::new(worker_for_factory.clone())),
+                move || Ok(IdaMcpServer::new(worker_for_factory.clone(), ServerMode::Http)),
                 session_manager,
                 config,
             );
@@ -324,8 +356,8 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
             tokio::spawn(async move {
                 if wait_for_shutdown_signal().await.is_ok() {
                     info!("Shutdown signal received");
-                    let _ = shutdown_worker.close().await;
-                    let _ = shutdown_worker.shutdown();
+                    let _ = shutdown_worker.close_for_shutdown().await;
+                    let _ = shutdown_worker.shutdown().await;
                     cancel_for_shutdown.cancel();
                 }
             });
@@ -355,10 +387,10 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
             #[allow(unreachable_code)]
             Ok::<_, anyhow::Error>(())
         });
-        if let Err(err) = result {
-            error!("HTTP server error: {err}");
-        }
-    });
+            if let Err(err) = result {
+                error!("HTTP server error: {err}");
+            }
+        });
 
     info!("Starting IDA worker loop");
     ida::run_ida_loop_no_init(rx);
@@ -475,15 +507,6 @@ fn run_probe(args: ProbeArgs) -> anyhow::Result<()> {
 
     info!("Probe completed");
     Ok(())
-}
-
-fn expand_path(path: &str) -> PathBuf {
-    if let Some(stripped) = path.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(stripped);
-        }
-    }
-    PathBuf::from(path)
 }
 
 fn open_db_for_probe(path: &PathBuf, args: &ProbeArgs) -> Result<IDB, idalib::IDAError> {

@@ -5,9 +5,10 @@
 
 ## Discovery Workflow
 
-- `tools/list` returns the full tool set (currently 66 tools)
+- `tools/list` returns the full tool set (currently 65 tools)
 - `tool_catalog(query=...)` searches all tools by intent
 - `tool_help(name=...)` returns full documentation and schema
+- Call `close_idb` when done to release locks; in multi-client servers coordinate before closing (HTTP/SSE requires close_token from open_idb)
 
 Note: `open_idb` accepts .i64/.idb or raw binaries (Mach-O/ELF/PE). Raw binaries are
 auto-analyzed and saved as a .i64 alongside the input. If a sibling .dSYM
@@ -20,7 +21,7 @@ Database open/close and discovery tools
 | Tool | Description |
 |------|-------------|
 | `analysis_status` | Report auto-analysis status |
-| `close_idb` | Close the current database |
+| `close_idb` | Close the current database (release locks) |
 | `idb_meta` | Get database metadata and summary |
 | `load_debug_info` | Load external debug info (e.g., dSYM/DWARF) |
 | `open_idb` | Open an IDA database or raw binary |

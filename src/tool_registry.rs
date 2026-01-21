@@ -156,6 +156,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
                     Set load_debug_info=true to force loading external debug info after open \
                     (optionally specify debug_info_path). \
                     The database must be opened before using any other analysis tools. \
+                    Call close_idb when finished to release database locks; in multi-client servers, coordinate before closing. \
+                    In HTTP/SSE mode, open_idb returns a close_token that must be provided to close_idb. \
                     Returns metadata about the binary: file type, processor, bitness, function count.",
         example: r#"{"path": "/path/to/binary", "load_debug_info": true}"#,
         default: true,
@@ -185,10 +187,12 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "close_idb",
         category: ToolCategory::Core,
-        short_desc: "Close the current database",
+        short_desc: "Close the current database (release locks)",
         full_desc: "Close the currently open IDA database, releasing resources. \
-                    Call this when done with analysis or before opening a different database.",
-        example: r#"{}"#,
+                    Call this when done with analysis or before opening a different database. \
+                    In multi-client servers, coordinate before closing to avoid interrupting others. \
+                    In HTTP/SSE mode, provide the close_token returned by open_idb.",
+        example: r#"{"close_token": "token-from-open-idb"}"#,
         default: true,
         keywords: &["close", "unload", "database"],
     },

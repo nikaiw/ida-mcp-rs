@@ -51,6 +51,9 @@ pub enum ToolError {
     #[error("Operation timed out after {0} seconds")]
     Timeout(u64),
 
+    #[error("Server is busy (request queue full). Please retry.")]
+    Busy,
+
     #[error("IDA error: {0}")]
     IdaError(String),
 

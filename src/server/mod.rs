@@ -22,6 +22,13 @@ use tracing::{debug, info, instrument};
 pub struct IdaMcpServer {
     worker: Arc<IdaWorker>,
     tool_mux: ToolMux<IdaMcpServer>,
+    mode: ServerMode,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ServerMode {
+    Stdio,
+    Http,
 }
 
 #[derive(Clone)]
@@ -56,13 +63,55 @@ where
 }
 
 impl IdaMcpServer {
-    pub fn new(worker: Arc<IdaWorker>) -> Self {
+    pub fn new(worker: Arc<IdaWorker>, mode: ServerMode) -> Self {
         info!("Creating IDA MCP server");
         let call_router = Self::tool_router();
         Self {
             worker,
             tool_mux: ToolMux::new(call_router),
+            mode,
         }
+    }
+
+    fn close_hint(&self) -> &'static str {
+        match self.mode {
+            ServerMode::Stdio => {
+                "Call close_idb when done to release locks for other sessions."
+            }
+            ServerMode::Http => {
+                "In multi-client (HTTP/SSE) mode, close_idb requires the close_token returned by open_idb; only the opener should close."
+            }
+        }
+    }
+
+    fn instructions(&self) -> String {
+        format!(
+            "IDA Pro headless analysis server for reverse engineering binaries. \
+                 \n\nWorkflow: \
+                 \n1. open_idb: Open a .i64/.idb file or a raw binary (Mach-O/ELF/PE). Large DBs may take 30+ seconds. \
+                 \n   load_debug_info: Optional for existing .i64 to load DWARF/dSYM \
+                 \n2. tool_catalog: Discover tools for your task (e.g., 'find callers', 'decompile') \
+                 \n3. tool_help: Get full docs for a specific tool \
+                 \n4. Use the discovered tools to analyze the binary \
+                 \n5. close_idb: Optionally close when done \
+                 \n\nNote: tools/list exposes the full tool set by default; use tool_catalog/tool_help to discover usage. \
+                 \n{close_hint} \
+                 \n\nTool Categories: \
+                 \n- core: open/close/discover (open_idb, close_idb, tool_catalog, tool_help, idb_meta) \
+                 \n- functions: list, resolve, lookup functions \
+                 \n- disassembly: disasm at addresses \
+                 \n- decompile: Hex-Rays pseudocode \
+                 \n- xrefs: cross-reference analysis \
+                 \n- control_flow: CFG, callgraph, paths \
+                 \n- memory: read bytes, strings, values \
+                 \n- search: find patterns, strings \
+                 \n- metadata: segments, imports, exports \
+                 \n- types: declare_type, apply_types (addr/stack), infer_types, local_types, stack_frame, declare_stack, delete_stack, structs (list/info/read) \
+                \n- editing: comments/rename/patch/patch_asm \
+                 \n\nTip: Use tool_catalog(query='what you want to do') to find the right tool. \
+                 \nTip: If xrefs/decompile look incomplete, call analysis_status to check auto-analysis.",
+            close_hint = self.close_hint()
+        )
     }
 
     fn validate_path(path: &str) -> bool {
@@ -253,6 +302,8 @@ impl IdaMcpServer {
         its DWARF debug info is loaded automatically. \
         Set load_debug_info=true to force loading external debug info after open \
         (optionally specify debug_info_path). \
+        Call close_idb when finished to release database locks; in multi-client servers, coordinate before closing. \
+        In HTTP/SSE mode, open_idb returns a close_token that must be provided to close_idb. \
         NOTE: Opening large databases (like dyld_shared_cache) can take 30+ seconds. \
         The database stays open until close_idb is called, so you can make multiple \
         queries (list_functions, disasm, decompile, etc.) without reopening."
@@ -275,10 +326,16 @@ impl IdaMcpServer {
                 req.load_debug_info.unwrap_or(false),
                 req.debug_info_path.clone(),
                 req.debug_info_verbose.unwrap_or(false),
+                req.force.unwrap_or(false),
             )
             .await
         {
             Ok(info) => {
+                let close_token = if matches!(self.mode, ServerMode::Http) {
+                    self.worker.issue_close_token()
+                } else {
+                    None
+                };
                 let mut value = match serde_json::to_value(&info) {
                     Ok(v) => v,
                     Err(_) => {
@@ -296,9 +353,14 @@ impl IdaMcpServer {
                             "disasm_by_name",
                             "decompile",
                             "xrefs_to",
-                            "strings"
+                            "strings",
+                            "close_idb"
                         ]),
                     );
+                    map.insert("close_hint".to_string(), json!(self.close_hint()));
+                    if let Some(token) = close_token {
+                        map.insert("close_token".to_string(), json!(token));
+                    }
                 }
                 Ok(CallToolResult::success(vec![Content::text(
                     serde_json::to_string_pretty(&value).unwrap_or_else(|_| format!("{value:?}")),
@@ -345,12 +407,25 @@ impl IdaMcpServer {
 
     #[tool(description = "Close the currently open IDA database. \
         Call this when you're done analyzing to free resources. \
+        In HTTP/SSE mode, provide the close_token returned by open_idb. \
         The database can also be left open for the duration of the session.")]
     #[instrument(skip(self))]
-    async fn close_idb(&self) -> Result<CallToolResult, McpError> {
+    async fn close_idb(
+        &self,
+        Parameters(req): Parameters<CloseIdbRequest>,
+    ) -> Result<CallToolResult, McpError> {
         info!("Tool call: close_idb received");
+        if matches!(self.mode, ServerMode::Http)
+            && !self.worker.close_token_matches(req.token.as_deref())
+        {
+            info!("close_idb ignored: owner token required");
+            return Ok(CallToolResult::success(vec![Content::text(
+                "close_idb ignored: owner token required",
+            )]));
+        }
         match self.worker.close().await {
             Ok(()) => {
+                self.worker.clear_close_token();
                 info!("Tool call: close_idb completed successfully");
                 Ok(CallToolResult::success(vec![Content::text(
                     "Database closed",
@@ -2266,7 +2341,7 @@ fn tool_params_schema(name: &str) -> Option<Value> {
     match name {
         // Core
         "open_idb" => Some(schema::<OpenIdbRequest>()),
-        "close_idb" => Some(schema::<EmptyParams>()),
+        "close_idb" => Some(schema::<CloseIdbRequest>()),
         "load_debug_info" => Some(schema::<LoadDebugInfoRequest>()),
         "analysis_status" => Some(schema::<EmptyParams>()),
         "tool_catalog" => Some(schema::<ToolCatalogRequest>()),
@@ -2343,35 +2418,8 @@ fn tool_params_schema(name: &str) -> Option<Value> {
 impl ServerHandler for IdaMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
-            capabilities: ServerCapabilities::builder()
-                .enable_tools()
-                .build(),
-            instructions: Some(
-                "IDA Pro headless analysis server for reverse engineering binaries. \
-                 \n\nWorkflow: \
-                 \n1. open_idb: Open a .i64/.idb file or a raw binary (Mach-O/ELF/PE). Large DBs may take 30+ seconds. \
-                 \n   load_debug_info: Optional for existing .i64 to load DWARF/dSYM \
-                 \n2. tool_catalog: Discover tools for your task (e.g., 'find callers', 'decompile') \
-                 \n3. tool_help: Get full docs for a specific tool \
-                 \n4. Use the discovered tools to analyze the binary \
-                 \n5. close_idb: Optionally close when done \
-                 \n\nNote: tools/list exposes the full tool set by default; use tool_catalog/tool_help to discover usage. \
-                 \n\nTool Categories: \
-                 \n- core: open/close/discover (open_idb, close_idb, tool_catalog, tool_help, idb_meta) \
-                 \n- functions: list, resolve, lookup functions \
-                 \n- disassembly: disasm at addresses \
-                 \n- decompile: Hex-Rays pseudocode \
-                 \n- xrefs: cross-reference analysis \
-                 \n- control_flow: CFG, callgraph, paths \
-                 \n- memory: read bytes, strings, values \
-                 \n- search: find patterns, strings \
-                 \n- metadata: segments, imports, exports \
-                 \n- types: declare_type, apply_types (addr/stack), infer_types, local_types, stack_frame, declare_stack, delete_stack, structs (list/info/read) \
-                \n- editing: comments/rename/patch/patch_asm \
-                 \n\nTip: Use tool_catalog(query='what you want to do') to find the right tool. \
-                 \nTip: If xrefs/decompile look incomplete, call analysis_status to check auto-analysis."
-                    .to_string(),
-            ),
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            instructions: Some(self.instructions()),
             ..Default::default()
         }
     }

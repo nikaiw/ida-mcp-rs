@@ -119,12 +119,19 @@ echo "$func_resp" | grep -q "interesting_function" || {
   exit 1
 }
 
+close_token="$(echo "$open_resp" | sed -n 's/.*\\\"close_token\\\"[[:space:]]*:[[:space:]]*\\\"\\([^\\\"]*\\)\\\".*/\\1/p')"
+if [[ -n "$close_token" ]]; then
+  close_args="{\"close_token\":\"$close_token\"}"
+else
+  close_args="{}"
+fi
+
 curl -sS \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -H "Origin: $ORIGIN" \
   -H "Mcp-Session-Id: $session_id" \
-  -d '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}' \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"close_idb\",\"arguments\":$close_args}}" \
   "http://127.0.0.1:$PORT/" >/dev/null
 
 echo "HTTP integration test passed"

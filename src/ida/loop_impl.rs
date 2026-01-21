@@ -13,6 +13,16 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+/// Log result with debug on success and warn on error.
+macro_rules! log_result {
+    ($result:expr, $ok_msg:literal, $err_msg:literal) => {
+        match &$result {
+            Ok(_) => debug!($ok_msg),
+            Err(e) => warn!(error = %e, $err_msg),
+        }
+    };
+}
+
 /// Run the IDA worker loop on the current (main) thread.
 /// This function blocks until Shutdown is received.
 /// IDA must already be initialized via `idalib::init_library()` before calling this.
@@ -28,9 +38,10 @@ pub fn run_ida_loop_no_init(rx: mpsc::Receiver<IdaRequest>) {
                 load_debug_info,
                 debug_info_path,
                 debug_info_verbose,
+                force,
                 resp,
             } => {
-                info!(path = %path, "Opening database");
+                info!(path = %path, force, "Opening database");
                 let result = database::handle_open(
                     &mut idb,
                     &mut lock_file,
@@ -39,6 +50,7 @@ pub fn run_ida_loop_no_init(rx: mpsc::Receiver<IdaRequest>) {
                     load_debug_info,
                     debug_info_path.as_deref(),
                     debug_info_verbose,
+                    force,
                 );
                 match &result {
                     Ok(info) => info!(
@@ -198,10 +210,7 @@ pub fn run_ida_loop_no_init(rx: mpsc::Receiver<IdaRequest>) {
             } => {
                 debug!(relaxed, replace, multi, "Declaring type");
                 let result = types::handle_declare_type(&idb, &decl, relaxed, replace, multi);
-                match &result {
-                    Ok(_) => debug!("Declared type"),
-                    Err(e) => warn!(error = %e, "Failed to declare type"),
-                }
+                log_result!(result, "Declared type", "Failed to declare type");
                 let _ = resp.send(result);
             }
             IdaRequest::ApplyTypes {
@@ -241,10 +250,7 @@ pub fn run_ida_loop_no_init(rx: mpsc::Receiver<IdaRequest>) {
                     delay,
                     strict,
                 );
-                match &result {
-                    Ok(_) => debug!("Applied type"),
-                    Err(e) => warn!(error = %e, "Failed to apply type"),
-                }
+                log_result!(result, "Applied type", "Failed to apply type");
                 let _ = resp.send(result);
             }
             IdaRequest::InferTypes {
@@ -270,10 +276,7 @@ pub fn run_ida_loop_no_init(rx: mpsc::Receiver<IdaRequest>) {
                 debug!(address = ?addr, name = ?name, offset, "Getting address info");
                 let resolved = resolve_address(&idb, addr, name.as_deref(), offset);
                 let result = resolved.and_then(|ea| address::handle_addr_info(&idb, ea));
-                match &result {
-                    Ok(_) => debug!("Got address info"),
-                    Err(e) => warn!(error = %e, "Failed to get address info"),
-                }
+                log_result!(result, "Got address info", "Failed to get address info");
                 let _ = resp.send(result);
             }
             IdaRequest::FunctionAt {
@@ -285,10 +288,11 @@ pub fn run_ida_loop_no_init(rx: mpsc::Receiver<IdaRequest>) {
                 debug!(address = ?addr, name = ?name, offset, "Getting function at address");
                 let resolved = resolve_address(&idb, addr, name.as_deref(), offset);
                 let result = resolved.and_then(|ea| functions::handle_function_at(&idb, ea));
-                match &result {
-                    Ok(_) => debug!("Got function at address"),
-                    Err(e) => warn!(error = %e, "Failed to get function at address"),
-                }
+                log_result!(
+                    result,
+                    "Got function at address",
+                    "Failed to get function at address"
+                );
                 let _ = resp.send(result);
             }
             IdaRequest::DisasmFunctionAt {
@@ -308,10 +312,11 @@ pub fn run_ida_loop_no_init(rx: mpsc::Receiver<IdaRequest>) {
                 let resolved = resolve_address(&idb, addr, name.as_deref(), offset);
                 let result =
                     resolved.and_then(|ea| disasm::handle_disasm_function_at(&idb, ea, count));
-                match &result {
-                    Ok(_) => debug!("Disassembled function"),
-                    Err(e) => warn!(error = %e, "Failed to disassemble function"),
-                }
+                log_result!(
+                    result,
+                    "Disassembled function",
+                    "Failed to disassemble function"
+                );
                 let _ = resp.send(result);
             }
             IdaRequest::DeclareStack {
@@ -558,8 +563,8 @@ pub fn run_ida_loop_no_init(rx: mpsc::Receiver<IdaRequest>) {
                     &comment,
                     repeatable,
                 );
-                if result.is_err() {
-                    warn!(error = %result.as_ref().err().unwrap(), "Failed to set comment");
+                if let Err(e) = &result {
+                    warn!(error = %e, "Failed to set comment");
                 }
                 let _ = resp.send(result);
             }
@@ -586,8 +591,8 @@ pub fn run_ida_loop_no_init(rx: mpsc::Receiver<IdaRequest>) {
                     &new_name,
                     flags,
                 );
-                if result.is_err() {
-                    warn!(error = %result.as_ref().err().unwrap(), "Failed to rename");
+                if let Err(e) = &result {
+                    warn!(error = %e, "Failed to rename");
                 }
                 let _ = resp.send(result);
             }
@@ -610,8 +615,8 @@ pub fn run_ida_loop_no_init(rx: mpsc::Receiver<IdaRequest>) {
                 );
                 let result =
                     memory::handle_patch_bytes(&idb, addr, name.as_deref(), offset, &bytes);
-                if result.is_err() {
-                    warn!(error = %result.as_ref().err().unwrap(), "Failed to patch bytes");
+                if let Err(e) = &result {
+                    warn!(error = %e, "Failed to patch bytes");
                 }
                 let _ = resp.send(result);
             }
@@ -633,8 +638,8 @@ pub fn run_ida_loop_no_init(rx: mpsc::Receiver<IdaRequest>) {
                     "Patching asm"
                 );
                 let result = memory::handle_patch_asm(&idb, addr, name.as_deref(), offset, &line);
-                if result.is_err() {
-                    warn!(error = %result.as_ref().err().unwrap(), "Failed to patch asm");
+                if let Err(e) = &result {
+                    warn!(error = %e, "Failed to patch asm");
                 }
                 let _ = resp.send(result);
             }

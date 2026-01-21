@@ -21,7 +21,7 @@ make test-http  # HTTP/SSE integration test
 **HTTP test** (`make test-http`)
 - Streamable HTTP transport with SSE
 - `tools/list` returns the full tool list
-- Database operations work over HTTP (`open_idb`, `list_functions`, `close_idb`)
+- Database operations work over HTTP (`open_idb`, `list_functions`, `close_idb` with close_token)
 
 ## Test fixture
 

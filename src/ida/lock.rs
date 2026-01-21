@@ -3,8 +3,9 @@
 use crate::error::ToolError;
 use idalib::IDAError;
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, Write};
+use std::io::{BufRead, BufReader, Seek, Write};
 use std::path::{Path, PathBuf};
+use tracing::{info, warn};
 
 /// Lock file for an open IDA database to prevent concurrent access.
 pub(crate) struct McpLock {
@@ -101,6 +102,115 @@ pub(crate) fn release_mcp_lock(lock_file: &mut Option<File>, lock_path: &mut Opt
 pub(crate) fn release_mcp_lock_file(lock: McpLock) {
     let (_file, path) = lock.into_parts();
     let _ = std::fs::remove_file(path);
+}
+
+/// Information about a stale lock that was cleaned up.
+#[derive(Debug)]
+pub struct StaleLockInfo {
+    pub path: PathBuf,
+    pub pid: u32,
+    pub reason: String,
+}
+
+/// Clean up stale MCP lock files for a database path.
+/// Returns information about any stale locks that were removed.
+pub(crate) fn clean_stale_mcp_lock(db_path: &Path) -> Option<StaleLockInfo> {
+    let mut lock_path = db_path.to_path_buf();
+    lock_path.set_extension("imcp");
+
+    if !lock_path.exists() {
+        return None;
+    }
+
+    // Try to read the lock file to get the PID
+    let pid = match read_lock_file_pid(&lock_path) {
+        Some(pid) => pid,
+        None => {
+            // Can't read PID, but file exists - try to acquire lock to check if stale
+            if let Ok(file) = OpenOptions::new().read(true).write(true).open(&lock_path) {
+                if try_lock_file(&file).is_ok() {
+                    // We got the lock - file was stale (no process holding fcntl lock)
+                    drop(file);
+                    if std::fs::remove_file(&lock_path).is_ok() {
+                        info!(path = %lock_path.display(), "Removed stale lock file (no valid PID, no fcntl lock)");
+                        return Some(StaleLockInfo {
+                            path: lock_path,
+                            pid: 0,
+                            reason: "no valid PID and no fcntl lock held".to_string(),
+                        });
+                    }
+                }
+            }
+            return None;
+        }
+    };
+
+    // Check if the process is still running
+    if is_process_running(pid) {
+        // Process is still alive - lock is valid
+        return None;
+    }
+
+    // Process is dead - this is a stale lock
+    info!(
+        path = %lock_path.display(),
+        pid = pid,
+        "Found stale lock file from dead process"
+    );
+
+    // Remove the stale lock file
+    if let Err(e) = std::fs::remove_file(&lock_path) {
+        warn!(
+            path = %lock_path.display(),
+            error = %e,
+            "Failed to remove stale lock file"
+        );
+        return None;
+    }
+
+    info!(path = %lock_path.display(), pid = pid, "Removed stale lock file");
+    Some(StaleLockInfo {
+        path: lock_path,
+        pid,
+        reason: format!("process {} is no longer running", pid),
+    })
+}
+
+/// Read the PID from a lock file.
+fn read_lock_file_pid(lock_path: &Path) -> Option<u32> {
+    let file = File::open(lock_path).ok()?;
+    let reader = BufReader::new(file);
+
+    for line in reader.lines().map_while(Result::ok) {
+        if let Some(pid_str) = line.strip_prefix("pid=") {
+            return pid_str.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// Check if a process with the given PID is still running.
+#[cfg(unix)]
+fn is_process_running(pid: u32) -> bool {
+    // Send signal 0 to check if process exists
+    // SAFETY: kill with signal 0 is safe - it doesn't actually send a signal,
+    // just checks if the process exists and we have permission to signal it.
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+    // If kill returns -1, check errno
+    // ESRCH means no such process
+    // EPERM means process exists but we don't have permission (still running)
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    errno == libc::EPERM
+}
+
+#[cfg(not(unix))]
+fn is_process_running(_pid: u32) -> bool {
+    // On non-Unix platforms, assume process might be running
+    // This is conservative - won't clean up locks that might be stale
+    true
 }
 
 /// Detect if a database file is locked by another process.

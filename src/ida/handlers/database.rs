@@ -1,8 +1,11 @@
 //! Database open/close handlers.
 
 use crate::error::ToolError;
+use crate::expand_path;
 use crate::ida::handlers::analysis::build_analysis_status;
-use crate::ida::lock::{acquire_mcp_lock, detect_db_lock, release_mcp_lock_file};
+use crate::ida::lock::{
+    acquire_mcp_lock, clean_stale_mcp_lock, detect_db_lock, release_mcp_lock_file,
+};
 use crate::ida::types::{DbInfo, DebugInfoLoad};
 use idalib::{IDBOpenOptions, IDB};
 use serde_json::{json, Value};
@@ -13,6 +16,26 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
+
+/// Build `DbInfo` from an open IDB.
+fn build_db_info(db: &IDB, path: &str, debug_info: Option<DebugInfoLoad>) -> DbInfo {
+    let meta = db.meta();
+    DbInfo {
+        path: path.to_string(),
+        file_type: format!("{:?}", meta.filetype()),
+        processor: db.processor().long_name(),
+        bits: if meta.is_64bit() {
+            64
+        } else if meta.is_32bit_exactly() {
+            32
+        } else {
+            16
+        },
+        function_count: db.function_count(),
+        debug_info,
+        analysis_status: build_analysis_status(db),
+    }
+}
 
 // Helper functions for debug info paths
 
@@ -30,12 +53,7 @@ fn dsym_expected_path_for_binary(path: &Path) -> Option<PathBuf> {
 }
 
 fn dsym_path_for_binary(path: &Path) -> Option<PathBuf> {
-    let dwarf_path = dsym_expected_path_for_binary(path)?;
-    if dwarf_path.exists() {
-        Some(dwarf_path)
-    } else {
-        None
-    }
+    dsym_expected_path_for_binary(path).filter(|p| p.exists())
 }
 
 fn unpacked_id0_path(path: &Path) -> Option<PathBuf> {
@@ -48,6 +66,7 @@ fn unpacked_id0_path(path: &Path) -> Option<PathBuf> {
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn handle_open(
     idb: &mut Option<IDB>,
     lock_file: &mut Option<File>,
@@ -56,17 +75,9 @@ pub fn handle_open(
     load_debug_info: bool,
     debug_info_path: Option<&str>,
     debug_info_verbose: bool,
+    force: bool,
 ) -> Result<DbInfo, ToolError> {
-    // Expand ~ to home directory
-    let expanded = if let Some(stripped) = path.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            PathBuf::from(home).join(stripped)
-        } else {
-            PathBuf::from(path)
-        }
-    } else {
-        PathBuf::from(path)
-    };
+    let expanded = expand_path(path);
 
     // Check if a database is already open
     if let Some(db) = idb.as_ref() {
@@ -74,25 +85,7 @@ pub fn handle_open(
         if current_path == expanded {
             // Same database - return its info instead of reopening
             info!(path = %expanded.display(), "Database already open, returning existing info");
-            let meta = db.meta();
-            let file_type = format!("{:?}", meta.filetype());
-            let processor = db.processor().long_name();
-            let bits = if meta.is_64bit() {
-                64
-            } else if meta.is_32bit_exactly() {
-                32
-            } else {
-                16
-            };
-            return Ok(DbInfo {
-                path: current_path.display().to_string(),
-                file_type,
-                processor,
-                bits,
-                function_count: db.function_count(),
-                debug_info: None,
-                analysis_status: build_analysis_status(db),
-            });
+            return Ok(build_db_info(db, &current_path.display().to_string(), None));
         } else {
             // Different database - tell them to close first
             return Err(ToolError::DatabaseAlreadyOpen(
@@ -127,6 +120,18 @@ pub fn handle_open(
             dsym_path = dsym_path_for_binary(&expanded);
         }
         raw_out_path = Some(out_path);
+    }
+
+    // If force is enabled, try to clean up stale lock files from crashed sessions
+    if force {
+        if let Some(stale) = clean_stale_mcp_lock(&expanded) {
+            info!(
+                path = %stale.path.display(),
+                pid = stale.pid,
+                reason = %stale.reason,
+                "Cleaned up stale lock file"
+            );
+        }
     }
 
     // Acquire MCP lock file (to detect other ida-mcp instances)
@@ -264,37 +269,16 @@ pub fn handle_open(
         }
     }
 
-    // Gather metadata
-    let meta = db.meta();
-    let file_type = format!("{:?}", meta.filetype());
-    let processor = db.processor().long_name();
-    let bits = if meta.is_64bit() {
-        64
-    } else if meta.is_32bit_exactly() {
-        32
-    } else {
-        16
-    };
-
-    let function_count = db.function_count();
+    let path_str = opened_path.display().to_string();
+    let info = build_db_info(&db, &path_str, debug_info);
     info!(
         "IDA open success: type={} proc={} bits={} functions={} elapsed={}s",
-        file_type,
-        processor,
-        bits,
-        function_count,
+        info.file_type,
+        info.processor,
+        info.bits,
+        info.function_count,
         open_start.elapsed().as_secs()
     );
-
-    let info = DbInfo {
-        path: opened_path.display().to_string(),
-        file_type,
-        processor,
-        bits,
-        function_count,
-        debug_info,
-        analysis_status: build_analysis_status(&db),
-    };
 
     let (lf, lp) = mcp_lock.into_parts();
     *lock_file = Some(lf);

@@ -8,7 +8,9 @@ use serde_json::Value;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct OpenIdbRequest {
-    #[schemars(description = "Path to an IDA database (.i64/.idb) or raw binary")]
+    #[schemars(
+        description = "Path to an IDA database (.i64/.idb) or raw binary. Call close_idb when finished to release locks; in multi-client mode coordinate before closing."
+    )]
     pub path: String,
     #[schemars(description = "If true, load external debug info (dSYM/DWARF) after open")]
     #[serde(alias = "load_dsym")]
@@ -20,6 +22,19 @@ pub struct OpenIdbRequest {
     pub debug_info_path: Option<String>,
     #[schemars(description = "Verbose debug-info loading (default: false)")]
     pub debug_info_verbose: Option<bool>,
+    #[schemars(
+        description = "If true, clean up stale lock files from crashed sessions before opening. \
+        Use this when a previous ida-mcp session crashed and left behind lock files."
+    )]
+    #[serde(alias = "recover")]
+    pub force: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CloseIdbRequest {
+    #[schemars(description = "Ownership token returned by open_idb (required for HTTP/SSE).")]
+    #[serde(alias = "close_token", alias = "owner_token")]
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

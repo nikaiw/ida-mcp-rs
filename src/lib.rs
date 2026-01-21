@@ -76,6 +76,8 @@
 //! ## Headless limitations
 //! Debugger/UI/scripting features are not exposed in headless mode.
 
+use std::path::PathBuf;
+
 pub mod disasm;
 pub mod error;
 pub mod ida;
@@ -89,5 +91,12 @@ pub use ida::{
     SegmentInfo, StringInfo, StringListResult, StringXrefInfo, StringXrefsResult, SymbolInfo,
     XRefInfo,
 };
-pub use server::IdaMcpServer;
+pub use server::{IdaMcpServer, ServerMode};
 pub use tool_registry::{ToolCategory, ToolInfo, TOOL_REGISTRY};
+
+/// Expand `~/` prefix to the user's home directory.
+pub fn expand_path(path: &str) -> PathBuf {
+    path.strip_prefix("~/")
+        .and_then(|stripped| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(stripped)))
+        .unwrap_or_else(|| PathBuf::from(path))
+}
