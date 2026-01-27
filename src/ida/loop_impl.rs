@@ -3,7 +3,7 @@
 use crate::ida::handlers::resolve_address;
 use crate::ida::handlers::{
     address, analysis, annotations, controlflow, database, disasm, functions, globals, imports,
-    memory, search, segments, strings, structs, types, xrefs,
+    memory, scripting, search, segments, strings, structs, types, xrefs,
 };
 use crate::ida::lock::release_mcp_lock;
 use crate::ida::request::IdaRequest;
@@ -909,6 +909,20 @@ pub fn run_ida_loop_no_init(rx: mpsc::Receiver<IdaRequest>) {
                     Err(e) => {
                         warn!(address = format!("{:#x}", addr), error = %e, "Failed to get pseudocode")
                     }
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::PyEval {
+                code,
+                current_ea,
+                resp,
+            } => {
+                debug!(current_ea = ?current_ea, "Evaluating Python code");
+                let result = scripting::handle_py_eval(&idb, &code, current_ea);
+                match &result {
+                    Ok(r) if r.success => debug!("Python evaluation succeeded"),
+                    Ok(r) => warn!(error = ?r.error, "Python evaluation failed"),
+                    Err(e) => warn!(error = %e, "Python evaluation error"),
                 }
                 let _ = resp.send(result);
             }

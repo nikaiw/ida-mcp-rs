@@ -1011,4 +1011,20 @@ impl IdaWorker {
         })?;
         rx.await?
     }
+
+    /// Execute Python code in IDA context using IDAPython.
+    /// Can execute expressions (returns a value) or statements.
+    pub async fn py_eval(
+        &self,
+        code: String,
+        current_ea: Option<u64>,
+    ) -> Result<PyEvalResult, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::PyEval {
+            code,
+            current_ea,
+            resp: tx,
+        })?;
+        rx.await?
+    }
 }

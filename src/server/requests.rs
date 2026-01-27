@@ -645,3 +645,17 @@ pub struct ToolHelpRequest {
     #[schemars(description = "Name of the tool to get help for")]
     pub name: String,
 }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PyEvalRequest {
+    #[schemars(
+        description = "Python code to execute. Can be an expression (returns value) or statements."
+    )]
+    #[serde(alias = "script", alias = "expression", alias = "expr")]
+    pub code: String,
+    #[schemars(
+        description = "Optional current effective address for context (used in expression evaluation)"
+    )]
+    #[serde(alias = "ea", alias = "addr", alias = "address")]
+    pub current_ea: Option<String>,
+}

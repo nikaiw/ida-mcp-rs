@@ -75,7 +75,7 @@ impl ToolCategory {
             Self::Editing => "Patching, renaming, and comment editing",
             Self::Debug => "Debugger operations (headless unsupported)",
             Self::Ui => "UI/cursor helpers (headless unsupported)",
-            Self::Scripting => "Scripting/eval helpers (headless unsupported)",
+            Self::Scripting => "Python scripting and eval helpers",
         }
     }
 
@@ -818,6 +818,21 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         example: r#"{"current_name": "interesting_function", "name": "interesting_function_renamed", "flags": 0}"#,
         default: false,
         keywords: &["rename", "symbol", "edit"],
+    },
+
+    // === SCRIPTING ===
+    ToolInfo {
+        name: "py_eval",
+        category: ToolCategory::Scripting,
+        short_desc: "Execute Python code in IDA context",
+        full_desc: "Execute Python code in IDA context using IDAPython. \
+                    Can execute expressions (returns a value) or statements. \
+                    Has access to all IDA API modules (idaapi, idc, ida_*, etc.). \
+                    Returns a result object with success status, result value, and any error message. \
+                    NOTE: Requires IDAPython to be loaded in the IDA installation.",
+        example: r#"{"code": "idc.get_func_name(0x401000)"}"#,
+        default: false,
+        keywords: &["python", "script", "eval", "execute", "idapython"],
     },
 ];
 

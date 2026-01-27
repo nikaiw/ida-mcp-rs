@@ -2259,6 +2259,36 @@ impl IdaMcpServer {
             Err(e) => Ok(e.to_tool_result()),
         }
     }
+
+    #[tool(
+        description = "Execute Python code in IDA context using IDAPython. \
+        Can execute expressions (returns a value) or statements. \
+        Has access to all IDA API modules (idaapi, idc, ida_*, etc.). \
+        Returns a result object with success status, result value, and any error message. \
+        NOTE: Requires IDAPython to be loaded in the IDA installation."
+    )]
+    #[instrument(skip(self), fields(current_ea = ?req.current_ea))]
+    async fn py_eval(
+        &self,
+        Parameters(req): Parameters<PyEvalRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: py_eval");
+        let current_ea = if let Some(ref ea_str) = req.current_ea {
+            match Self::parse_address(ea_str) {
+                Ok(a) => Some(a),
+                Err(e) => return Ok(e.to_tool_result()),
+            }
+        } else {
+            None
+        };
+
+        match self.worker.py_eval(req.code.clone(), current_ea).await {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
 }
 
 async fn get_int_values(
