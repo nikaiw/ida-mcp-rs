@@ -72,7 +72,8 @@ where
 struct DscBackgroundCtx {
     idat: std::path::PathBuf,
     idat_args: Vec<String>,
-    log_path: std::path::PathBuf,
+    script_path: std::path::PathBuf,
+    log_path: Option<std::path::PathBuf>,
     out_i64: std::path::PathBuf,
     module: String,
     frameworks: Vec<String>,
@@ -369,6 +370,7 @@ impl IdaMcpServer {
         let DscBackgroundCtx {
             idat,
             idat_args,
+            script_path,
             log_path,
             out_i64,
             module,
@@ -416,26 +418,31 @@ impl IdaMcpServer {
         let (exit_code, stderr, out_path, log_out) = match spawn_result {
             Ok(tuple) => tuple,
             Err(e) => {
+                let _ = std::fs::remove_file(&script_path);
                 registry.fail(&task_id, &format!("idat task panicked: {e}"));
                 return;
             }
         };
 
+        // Clean up the temporary load script (idat is done with it).
+        let _ = std::fs::remove_file(&script_path);
+
         if exit_code != 0 || !out_path.exists() {
-            let log_tail = std::fs::read_to_string(&log_out)
-                .ok()
+            let log_tail = log_out
+                .as_ref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
                 .map(|s| {
                     let lines: Vec<&str> = s.lines().collect();
                     let start = lines.len().saturating_sub(20);
                     lines[start..].join("\n")
-                })
-                .unwrap_or_default();
+                });
 
-            let msg = format!(
-                "idat exited with code {exit_code}.\n\
-                 stderr: {stderr}\n\
-                 log (last 20 lines):\n{log_tail}"
+            let mut msg = format!(
+                "idat exited with code {exit_code}.\nstderr: {stderr}"
             );
+            if let Some(tail) = log_tail {
+                msg.push_str(&format!("\nlog (last 20 lines):\n{tail}"));
+            }
             warn!(exit_code, task_id = %task_id, "idat failed");
             registry.fail(&task_id, &msg);
             return;
@@ -2508,13 +2515,23 @@ impl IdaMcpServer {
             );
         }
 
-        let log_path = script_dir.join("ida_mcp_dsc.log");
+        let log_path = req.log_path.map(std::path::PathBuf::from);
+        if let Some(ref lp) = log_path {
+            if lp.to_string_lossy().contains("..") {
+                return Ok(
+                    ToolError::InvalidParams(
+                        "log_path must not contain '..' path traversal".into(),
+                    )
+                    .to_tool_result(),
+                );
+            }
+        }
         let idat_args = crate::dsc::idat_dsc_args(
             dsc_path,
             &out_i64,
             &script_path,
             &file_type,
-            Some(&log_path),
+            log_path.as_deref(),
         );
 
         // Create a background task and return immediately.
@@ -2554,6 +2571,7 @@ impl IdaMcpServer {
         let ctx = DscBackgroundCtx {
             idat,
             idat_args,
+            script_path,
             log_path,
             out_i64,
             module,
