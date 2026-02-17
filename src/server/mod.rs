@@ -437,9 +437,7 @@ impl IdaMcpServer {
                     lines[start..].join("\n")
                 });
 
-            let mut msg = format!(
-                "idat exited with code {exit_code}.\nstderr: {stderr}"
-            );
+            let mut msg = format!("idat exited with code {exit_code}.\nstderr: {stderr}");
             if let Some(tail) = log_tail {
                 msg.push_str(&format!("\nlog (last 20 lines):\n{tail}"));
             }
@@ -2518,12 +2516,10 @@ impl IdaMcpServer {
         let log_path = req.log_path.map(std::path::PathBuf::from);
         if let Some(ref lp) = log_path {
             if lp.to_string_lossy().contains("..") {
-                return Ok(
-                    ToolError::InvalidParams(
-                        "log_path must not contain '..' path traversal".into(),
-                    )
-                    .to_tool_result(),
-                );
+                return Ok(ToolError::InvalidParams(
+                    "log_path must not contain '..' path traversal".into(),
+                )
+                .to_tool_result());
             }
         }
         let idat_args = crate::dsc::idat_dsc_args(
@@ -2688,12 +2684,142 @@ impl IdaMcpServer {
         };
         let timeout = req.timeout_secs.map(|t| t.min(600));
         match self.worker.run_script(&code, timeout).await {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
+            Ok(result) => {
+                if !run_script_succeeded(&result) {
+                    let message = run_script_failure_message(&result);
+                    warn!(code_len = code.len(), error = %message, "run_script failed");
+                    return Ok(ToolError::IdaError(message).to_tool_result());
+                }
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|_| format!("{:?}", result)),
+                )]))
+            }
+            Err(ToolError::Timeout(timeout_secs)) => {
+                let message = run_script_timeout_message(timeout_secs, &code);
+                warn!(timeout_secs, code_len = code.len(), "run_script timed out");
+                Ok(ToolError::IdaError(message).to_tool_result())
+            }
             Err(e) => Ok(e.to_tool_result()),
         }
     }
+}
+
+const RUN_SCRIPT_PREVIEW_CHARS: usize = 220;
+const RUN_SCRIPT_TAIL_LINES: usize = 12;
+const RUN_SCRIPT_TAIL_CHARS: usize = 1600;
+
+fn run_script_succeeded(result: &Value) -> bool {
+    result.get("success").and_then(Value::as_bool) == Some(true)
+}
+
+fn run_script_field<'a>(result: &'a Value, field: &str) -> Option<&'a str> {
+    result.get(field).and_then(Value::as_str)
+}
+
+fn run_script_last_non_empty_line(text: &str) -> Option<&str> {
+    text.lines().rev().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
+}
+
+fn run_script_truncate_chars(input: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (count, ch) in input.chars().enumerate() {
+        if count >= max_chars {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn run_script_tail_lines(text: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
+}
+
+fn run_script_error_hint(error_details: &str) -> Option<&'static str> {
+    let lowered = error_details.to_ascii_lowercase();
+    if lowered.contains("syntaxerror") || lowered.contains("invalid syntax") {
+        return Some("Python syntax error detected. Regenerate valid Python and retry.");
+    }
+    if lowered.contains("nameerror") {
+        return Some("NameError detected. Check variable/module names before rerunning.");
+    }
+    if lowered.contains("attributeerror") {
+        return Some("AttributeError detected. Verify IDA API object names/methods.");
+    }
+    if lowered.contains("importerror") || lowered.contains("modulenotfounderror") {
+        return Some("Import failure detected. Ensure the required module exists in IDAPython.");
+    }
+    if lowered.contains("failed to execute wrapper") {
+        return Some(
+            "IDAPython wrapper execution failed before user code completed. Check stderr for details.",
+        );
+    }
+    None
+}
+
+fn run_script_failure_message(result: &Value) -> String {
+    let stderr = run_script_field(result, "stderr").unwrap_or_default();
+    let stdout = run_script_field(result, "stdout").unwrap_or_default();
+    let summary = run_script_field(result, "error_summary")
+        .or_else(|| run_script_field(result, "error"))
+        .or_else(|| run_script_last_non_empty_line(stderr))
+        .unwrap_or("Unknown IDAPython script failure (no error details captured)");
+
+    let stderr_tail = run_script_truncate_chars(
+        &run_script_tail_lines(stderr, RUN_SCRIPT_TAIL_LINES),
+        RUN_SCRIPT_TAIL_CHARS,
+    );
+    let stdout_tail = run_script_truncate_chars(
+        &run_script_tail_lines(stdout, RUN_SCRIPT_TAIL_LINES),
+        RUN_SCRIPT_TAIL_CHARS,
+    );
+
+    let mut parts = vec![format!("IDAPython script execution failed: {summary}")];
+    if let Some(kind) = run_script_field(result, "error_kind") {
+        parts.push(format!("Error kind: {kind}"));
+    }
+    if !stderr_tail.is_empty() {
+        parts.push(format!("stderr (tail):\n{stderr_tail}"));
+    }
+    if !stdout_tail.is_empty() {
+        parts.push(format!("stdout (tail):\n{stdout_tail}"));
+    }
+    let combined_details = format!("{summary}\n{stderr_tail}");
+    if let Some(hint) = run_script_error_hint(&combined_details) {
+        parts.push(format!("Hint: {hint}"));
+    }
+    parts.join("\n\n")
+}
+
+fn run_script_timeout_message(timeout_secs: u64, code: &str) -> String {
+    let compact_preview = code
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let preview = if compact_preview.is_empty() {
+        "<empty script>".to_string()
+    } else {
+        run_script_truncate_chars(&compact_preview, RUN_SCRIPT_PREVIEW_CHARS)
+    };
+    format!(
+        "run_script timed out after {timeout_secs} seconds.\n\
+         The script may be blocked in a long-running loop or waiting on IDA state.\n\
+         Script preview: {preview}\n\
+         Hint: while iterating with LLM-generated code, use a smaller timeout_secs and avoid scripts that block indefinitely."
+    )
 }
 
 async fn get_int_values(
@@ -3130,5 +3256,51 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
         ctx: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
         self.0.cancel_task(request, ctx).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        run_script_failure_message, run_script_succeeded, run_script_timeout_message,
+        run_script_truncate_chars,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn run_script_succeeded_only_for_explicit_true() {
+        assert!(run_script_succeeded(&json!({ "success": true })));
+        assert!(!run_script_succeeded(&json!({ "success": false })));
+        assert!(!run_script_succeeded(&json!({})));
+    }
+
+    #[test]
+    fn run_script_failure_message_adds_syntax_hint() {
+        let value = json!({
+            "success": false,
+            "stdout": "",
+            "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 1\nSyntaxError: invalid syntax",
+            "error": "invalid syntax"
+        });
+        let message = run_script_failure_message(&value);
+        assert!(message.contains("IDAPython script execution failed"));
+        assert!(message.contains("SyntaxError"));
+        assert!(message.contains("Hint: Python syntax error detected"));
+    }
+
+    #[test]
+    fn run_script_timeout_message_includes_preview() {
+        let code = "import idaapi\nfor _ in range(1000000000):\n    pass\n";
+        let message = run_script_timeout_message(120, code);
+        assert!(message.contains("run_script timed out after 120 seconds"));
+        assert!(message.contains("Script preview: import idaapi for _ in range(1000000000): pass"));
+    }
+
+    #[test]
+    fn run_script_truncate_chars_appends_ellipsis() {
+        let truncated = run_script_truncate_chars("abcdef", 3);
+        assert_eq!(truncated, "abc...");
+        let unchanged = run_script_truncate_chars("abc", 10);
+        assert_eq!(unchanged, "abc");
     }
 }

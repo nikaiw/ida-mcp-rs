@@ -272,10 +272,21 @@ mod tests {
 
     #[test]
     fn script_injection_escaped() {
+        use super::escape_python_string;
         let malicious = r#""); import os; os.system("rm -rf /"); print(""#;
+        let escaped = escape_python_string(malicious);
+        // Every `"` in the escaped string must be preceded by `\`.
+        // This prevents breaking out of the Python string literal.
+        for (i, ch) in escaped.char_indices() {
+            if ch == '"' {
+                assert!(
+                    i > 0 && escaped.as_bytes()[i - 1] == b'\\',
+                    "unescaped quote at index {i} in: {escaped}"
+                );
+            }
+        }
+        // The escaped form appears in the generated script
         let script = dsc_load_script(malicious, &[]);
-        // The injected quotes should be escaped, keeping the string intact
-        assert!(!script.contains("import os"));
-        assert!(script.contains("\\\""));
+        assert!(script.contains(&escaped));
     }
 }

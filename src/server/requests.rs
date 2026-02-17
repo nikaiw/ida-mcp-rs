@@ -685,9 +685,7 @@ pub struct OpenDscRequest {
     pub frameworks: Option<Vec<String>>,
     #[schemars(description = "IDA version: 8 or 9. Determines the -T format string. Default: 9")]
     pub ida_version: Option<u8>,
-    #[schemars(
-        description = "Path to write idat's log file (-L flag). \
-        If omitted, no log is created. Useful for debugging DSC loading failures."
-    )]
+    #[schemars(description = "Path to write idat's log file (-L flag). \
+        If omitted, no log is created. Useful for debugging DSC loading failures.")]
     pub log_path: Option<String>,
 }

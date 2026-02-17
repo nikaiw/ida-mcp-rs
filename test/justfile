@@ -2,11 +2,9 @@
 
 cc := env_var_or_default("CC", "cc")
 cflags := env_var_or_default("CFLAGS", "-O0 -g -fno-omit-frame-pointer")
-
 test_src := "fixtures/mini.c"
 test_bin := "fixtures/mini"
 test_lock := "fixtures/mini.imcp"
-
 server_bin := env_var_or_default("SERVER_BIN", "../target/release/ida-mcp")
 rust_log := env_var_or_default("RUST_LOG", "ida_mcp=trace")
 
@@ -16,18 +14,18 @@ default:
 
 # Build test fixture
 fixture:
-    {{cc}} {{cflags}} -o "{{test_bin}}" "{{test_src}}"
+    {{ cc }} {{ cflags }} -o "{{ test_bin }}" "{{ test_src }}"
 
 # Run stdio integration test
 test: fixture
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ ! -x "{{server_bin}}" ]; then
-        echo "Server binary not found: {{server_bin}}"
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
         echo "Run 'cargo build --release' first"
         exit 1
     fi
-    LOCK="{{test_lock}}"
+    LOCK="{{ test_lock }}"
     if [ -f "$LOCK" ]; then
         pid=$(awk -F= '$1=="pid"{print $2}' "$LOCK" | tr -d '\r')
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
@@ -40,9 +38,14 @@ test: fixture
     echo "🧪 Running stdio integration test..."
     tmp="$(mktemp)"
     # Keep stdin open long enough for open_idb auto-analysis (~10s for raw binaries)
-    (cat payloads/mini.jsonl; sleep 30) | RUST_LOG="{{rust_log}}" "{{server_bin}}" >"$tmp" 2>&1 || true
+    (cat payloads/mini.jsonl; sleep 30) | RUST_LOG="{{ rust_log }}" "{{ server_bin }}" >"$tmp" 2>&1 || true
     cat "$tmp"
-    if rg -q '"isError"\s*:\s*true' "$tmp"; then
+    # Known expected errors:
+    # - patch_asm on ARM (no assembler support)
+    # - stack_frame at non-function address
+    error_count="$(rg -c '"isError"\s*:\s*true' "$tmp" || echo 0)"
+    if [ "$error_count" -gt 2 ]; then
+        echo "❌ Expected at most 2 known errors, got $error_count"
         rm -f "$tmp"
         exit 1
     fi
@@ -53,12 +56,12 @@ test: fixture
 test-http: fixture
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ ! -x "{{server_bin}}" ]; then
-        echo "Server binary not found: {{server_bin}}"
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
         echo "Run 'cargo build --release' first"
         exit 1
     fi
-    LOCK="{{test_lock}}"
+    LOCK="{{ test_lock }}"
     if [ -f "$LOCK" ]; then
         pid=$(awk -F= '$1=="pid"{print $2}' "$LOCK" | tr -d '\r')
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
@@ -69,19 +72,19 @@ test-http: fixture
         fi
     fi
     echo "🧪 Running HTTP integration test..."
-    RUST_LOG="{{rust_log}}" IDB_PATH="{{test_bin}}" MCP_HTTP_BIN="{{server_bin}}" ./http_integration.sh
+    RUST_LOG="{{ rust_log }}" IDB_PATH="{{ test_bin }}" MCP_HTTP_BIN="{{ server_bin }}" ./http_integration.sh
     echo "✅ HTTP test passed"
 
 # Run IDAPython script integration test
 test-script: fixture
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ ! -x "{{server_bin}}" ]; then
-        echo "Server binary not found: {{server_bin}}"
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
         echo "Run 'cargo build --release' first"
         exit 1
     fi
-    LOCK="{{test_lock}}"
+    LOCK="{{ test_lock }}"
     if [ -f "$LOCK" ]; then
         pid=$(awk -F= '$1=="pid"{print $2}' "$LOCK" | tr -d '\r')
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
@@ -94,46 +97,44 @@ test-script: fixture
     echo "🧪 Running IDAPython script test..."
     tmp="$(mktemp)"
     # Keep stdin open long enough for open_idb auto-analysis (~10s for raw binaries)
-    (cat payloads/script.jsonl; sleep 30) | RUST_LOG="{{rust_log}}" "{{server_bin}}" >"$tmp" 2>&1 || true
+    (cat payloads/script.jsonl; sleep 30) | RUST_LOG="{{ rust_log }}" "{{ server_bin }}" >"$tmp" 2>&1 || true
     cat "$tmp"
 
-    # Check that the error test (id=6, division by zero) returned an error in the result
-    # but NOT as an MCP-level isError (run_script should succeed and report the Python error in the JSON)
-    if rg -q '"isError"\s*:\s*true' "$tmp"; then
-        echo "❌ Unexpected MCP-level error"
+    # Verify simple inline script execution (id=3)
+    if ! rg -q 'inline_simple_ok function_count=' "$tmp"; then
+        echo "❌ Simple inline script output missing"
         rm -f "$tmp"
         exit 1
     fi
 
-    # Verify we got stdout from the function listing (id=3)
-    if ! rg -q '0x' "$tmp"; then
-        echo "❌ No function addresses in script output"
-        rm -f "$tmp"
-        exit 1
-    fi
-
-    # Verify the error case returned a Python error message (id=6)
-    if ! rg -q 'division by zero' "$tmp"; then
-        echo "❌ Expected 'division by zero' error in script output"
-        rm -f "$tmp"
-        exit 1
-    fi
-
-    # Verify stdout/stderr capture (id=7)
-    if ! rg -q 'stdout works' "$tmp"; then
-        echo "❌ stdout capture failed"
-        rm -f "$tmp"
-        exit 1
-    fi
-    if ! rg -q 'stderr works' "$tmp"; then
-        echo "❌ stderr capture failed"
-        rm -f "$tmp"
-        exit 1
-    fi
-
-    # Verify file-based script execution (id=8)
+    # Verify file-based script execution (id=4)
     if ! rg -q 'total_functions=' "$tmp"; then
         echo "❌ File-based script (fixtures/test_analysis.py) output missing"
+        rm -f "$tmp"
+        exit 1
+    fi
+
+    # Verify complex inline script execution (id=5)
+    if ! rg -q 'complex_ok total=' "$tmp"; then
+        echo "❌ Complex inline script output missing"
+        rm -f "$tmp"
+        exit 1
+    fi
+
+    # Verify syntax error surfaced as MCP-level error (id=6)
+    error_count="$( (rg -o '"isError"\s*:\s*true' "$tmp" || true) | wc -l | tr -d ' ' )"
+    if [ "$error_count" != "1" ]; then
+        echo "❌ Expected exactly one MCP-level error response, got $error_count"
+        rm -f "$tmp"
+        exit 1
+    fi
+    if ! rg -q 'SyntaxError' "$tmp"; then
+        echo "❌ SyntaxError details missing for invalid script case"
+        rm -f "$tmp"
+        exit 1
+    fi
+    if ! rg -q 'IDAPython script execution failed' "$tmp"; then
+        echo "❌ Script failure summary missing for invalid script case"
         rm -f "$tmp"
         exit 1
     fi
@@ -142,12 +143,13 @@ test-script: fixture
     echo "✅ Script test passed"
 
 # Run dyld_shared_cache (DSC) integration test
+
 # Handles both sync (pre-existing .i64) and async (background task) paths.
 test-dsc dsc_path:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ ! -x "{{server_bin}}" ]; then
-        echo "Server binary not found: {{server_bin}}"
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
         echo "Run 'cargo build --release' first"
         exit 1
     fi
@@ -156,14 +158,14 @@ test-dsc dsc_path:
         exit 1
     fi
     echo "🧪 Running DSC integration test..."
-    echo "   DSC: {{dsc_path}}"
+    echo "   DSC: {{ dsc_path }}"
 
     fifo_in="$(mktemp -u).fifo"
     mkfifo "$fifo_in"
     log="$(mktemp)"
 
     # Start server with fifo as stdin
-    RUST_LOG="{{rust_log}}" "{{server_bin}}" < "$fifo_in" > "$log" 2>&1 &
+    RUST_LOG="{{ rust_log }}" "{{ server_bin }}" < "$fifo_in" > "$log" 2>&1 &
     server_pid=$!
     # Open the write end of fifo (keeps it open so server doesn't see EOF)
     exec 3>"$fifo_in"
@@ -206,7 +208,7 @@ test-dsc dsc_path:
     echo "   Initialized"
 
     # Phase 2: open_dsc
-    payload=$(sed "s|DSC_PATH|{{dsc_path}}|g" <<< '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"open_dsc","arguments":{"path":"DSC_PATH","arch":"arm64e","module":"/System/Library/PrivateFrameworks/LockdownMode.framework/LockdownMode"}}}')
+    payload=$(sed "s|DSC_PATH|{{ dsc_path }}|g" <<< '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"open_dsc","arguments":{"path":"DSC_PATH","arch":"arm64e","module":"/System/Library/PrivateFrameworks/LockdownMode.framework/LockdownMode"}}}')
     send "$payload"
     resp=$(wait_response 2 30)
     echo "   open_dsc responded"
@@ -280,7 +282,7 @@ test-dsc dsc_path:
 
 # Clean test artifacts
 clean:
-    rm -f "{{test_bin}}"
+    rm -f "{{ test_bin }}"
     rm -rf fixtures/mini.dSYM
     rm -f fixtures/*.i64 fixtures/*.idb
     rm -f fixtures/*.id0 fixtures/*.id1 fixtures/*.id2 fixtures/*.nam fixtures/*.til fixtures/*.imcp

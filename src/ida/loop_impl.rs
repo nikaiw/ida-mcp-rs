@@ -932,8 +932,36 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>) {
             }
             IdaRequest::RunScript { code, resp } => {
                 debug!(code_len = code.len(), "Running script");
+                let started = std::time::Instant::now();
                 let result = script::handle_run_script(&idb, &code);
-                log_result!(result, "Script executed", "Failed to execute script");
+                let elapsed_ms = started.elapsed().as_millis();
+                match &result {
+                    Ok(value) => {
+                        let success = value.get("success").and_then(|v| v.as_bool()) == Some(true);
+                        let stdout_len = value
+                            .get("stdout")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.len())
+                            .unwrap_or(0);
+                        let stderr_len = value
+                            .get("stderr")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.len())
+                            .unwrap_or(0);
+                        if success {
+                            debug!(elapsed_ms, stdout_len, stderr_len, "Script executed");
+                        } else {
+                            let error = value.get("error").and_then(|v| v.as_str()).unwrap_or("");
+                            warn!(
+                                elapsed_ms,
+                                stdout_len, stderr_len, error, "Script execution reported failure"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(elapsed_ms, error = %e, "Failed to execute script");
+                    }
+                }
                 let _ = resp.send(result);
             }
             IdaRequest::Shutdown => {

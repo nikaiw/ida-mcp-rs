@@ -85,6 +85,7 @@ update-beta-cask ida_version="9.4":
     echo "Pushed beta cask to homebrew-tap"
 
 # Update homebrew stable cask in tap (run after GitHub release is created)
+
 # Pass revision="" (default) for a fresh version, or revision="1" etc. for rebuilds.
 update-cask revision="":
     #!/usr/bin/env bash
@@ -168,6 +169,10 @@ test: build
 # Run HTTP integration test (debug)
 test-http: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-http
+
+# Run IDAPython script integration test (debug)
+test-script: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-script
 
 # Run cargo unit tests
 cargo-test:
