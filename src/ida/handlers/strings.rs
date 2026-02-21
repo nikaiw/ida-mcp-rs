@@ -5,6 +5,7 @@ use crate::ida::handlers::hex_encode;
 use crate::ida::types::{StringInfo, StringListResult, StringXrefInfo, StringXrefsResult};
 use idalib::xref::XRefQuery;
 use idalib::IDB;
+use regex::RegexBuilder;
 use serde_json::{json, Value};
 
 pub fn handle_strings(
@@ -266,4 +267,43 @@ pub fn handle_xrefs_to_string(
         total,
         next_offset,
     })
+}
+
+/// Search strings using a case-insensitive regex pattern.
+pub fn handle_find_regex(
+    idb: &Option<IDB>,
+    pattern: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<Value, ToolError> {
+    let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    let re = RegexBuilder::new(pattern)
+        .case_insensitive(true)
+        .build()
+        .map_err(|e| ToolError::InvalidParams(format!("invalid regex: {e}")))?;
+
+    let mut matches = Vec::new();
+    let mut skipped = 0usize;
+
+    for (addr, content) in db.strings().iter() {
+        if re.is_match(&content) {
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            matches.push(json!({
+                "addr": format!("{:#x}", addr),
+                "string": content,
+            }));
+            if matches.len() >= limit {
+                break;
+            }
+        }
+    }
+
+    Ok(json!({
+        "pattern": pattern,
+        "n": matches.len(),
+        "matches": matches,
+    }))
 }

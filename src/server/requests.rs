@@ -28,6 +28,11 @@ pub struct OpenIdbRequest {
     )]
     #[serde(alias = "recover")]
     pub force: Option<bool>,
+    #[schemars(
+        description = "IDA file type selector (-T flag). Used to choose a specific loader, \
+        e.g. 'Apple DYLD cache for arm64e (single module(s))'. Only applies to raw binaries."
+    )]
+    pub file_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -65,12 +70,6 @@ pub struct ListFunctionsRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct AnalyzeFuncsRequest {
-    #[schemars(description = "Timeout in seconds for this operation (default: 120, max: 600)")]
-    pub timeout_secs: Option<u64>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ResolveFunctionRequest {
     #[schemars(description = "Function name to resolve (exact or partial match)")]
     pub name: String,
@@ -101,32 +100,10 @@ pub struct FunctionAtRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct DisasmFunctionAtRequest {
-    #[schemars(description = "Address (string/number)")]
-    #[serde(alias = "ea", alias = "addr", alias = "addresses")]
-    pub address: Option<Value>,
-    #[schemars(description = "Function or symbol name (alternative to address)")]
-    #[serde(alias = "name", alias = "symbol")]
-    pub target_name: Option<String>,
-    #[schemars(description = "Offset added to resolved name address (default: 0)")]
-    pub offset: Option<u64>,
-    #[schemars(description = "Number of instructions (1-5000, default: 200)")]
-    pub count: Option<usize>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
 pub struct DisasmRequest {
     #[schemars(description = "Address(es) to disassemble (string/number or array)")]
     #[serde(alias = "addrs", alias = "addr", alias = "addresses")]
     pub address: Value,
-    #[schemars(description = "Number of instructions (1-1000, default: 10)")]
-    pub count: Option<usize>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct DisasmByNameRequest {
-    #[schemars(description = "Function name to disassemble (exact or partial match)")]
-    pub name: String,
     #[schemars(description = "Number of instructions (1-1000, default: 10)")]
     pub count: Option<usize>,
 }
@@ -658,4 +635,65 @@ pub struct PyEvalRequest {
     )]
     #[serde(alias = "ea", alias = "addr", alias = "address")]
     pub current_ea: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetIntRequest {
+    #[schemars(description = "Integer read requests (ty, addr). ty: i8/u64/i16le/i16be/etc")]
+    #[serde(alias = "query", alias = "items")]
+    pub queries: Value,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PutIntRequest {
+    #[schemars(
+        description = "Integer write requests (ty, addr, value). value is a string; supports 0x.. and negatives"
+    )]
+    #[serde(alias = "query", alias = "queries")]
+    pub items: Value,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindRequest {
+    #[schemars(description = "Search type: 'string', 'immediate', 'data_ref', or 'code_ref'")]
+    #[serde(alias = "kind", alias = "type")]
+    pub r#type: String,
+    #[schemars(description = "Search targets (strings, integers, or addresses)")]
+    #[serde(alias = "query", alias = "queries", alias = "target")]
+    pub targets: Value,
+    #[schemars(description = "Max matches per target (default: 1000, max: 10000)")]
+    #[serde(alias = "count")]
+    pub limit: Option<usize>,
+    #[schemars(description = "Skip first N matches (default: 0)")]
+    pub offset: Option<usize>,
+    #[schemars(description = "Timeout in seconds for this operation (default: 120, max: 600)")]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindRegexRequest {
+    #[schemars(description = "Regex pattern to search for in strings")]
+    pub pattern: String,
+    #[schemars(description = "Max matches (default: 30, max: 500)")]
+    #[serde(alias = "count")]
+    pub limit: Option<usize>,
+    #[schemars(description = "Skip first N matches (default: 0)")]
+    pub offset: Option<usize>,
+    #[schemars(description = "Timeout in seconds for this operation (default: 120, max: 600)")]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RunScriptRequest {
+    #[schemars(
+        description = "Python code to execute via IDAPython. Has full access to ida_* modules, \
+        idc, idautils. stdout/stderr are captured and returned. \
+        Provide either 'code' (inline) or 'file' (path to .py), not both."
+    )]
+    pub code: Option<String>,
+    #[schemars(description = "Path to a .py file to execute via IDAPython. \
+        Mutually exclusive with 'code'.")]
+    pub file: Option<String>,
+    #[schemars(description = "Timeout in seconds for this operation (default: 120, max: 600)")]
+    pub timeout_secs: Option<u64>,
 }

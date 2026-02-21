@@ -75,7 +75,7 @@ impl ToolCategory {
             Self::Editing => "Patching, renaming, and comment editing",
             Self::Debug => "Debugger operations (headless unsupported)",
             Self::Ui => "UI/cursor helpers (headless unsupported)",
-            Self::Scripting => "Python scripting and eval helpers",
+            Self::Scripting => "Execute Python scripts via IDAPython",
         }
     }
 
@@ -242,17 +242,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["functions", "list", "enumerate", "find", "filter", "subroutines"],
     },
-    ToolInfo {
-        name: "list_funcs",
-        category: ToolCategory::Functions,
-        short_desc: "Alias of list_functions",
-        full_desc: "Alias of list_functions. Lists all functions in the database with pagination \
-                    and optional name filtering.",
-        example: r#"{"offset": 0, "limit": 100, "filter": "init"}"#,
-        default: false,
-        keywords: &["functions", "list", "alias"],
-    },
-    ToolInfo {
+ToolInfo {
         name: "resolve_function",
         category: ToolCategory::Functions,
         short_desc: "Find function address by name",
@@ -282,19 +272,9 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["lookup", "batch", "multiple", "functions", "names"],
     },
-    ToolInfo {
-        name: "analyze_funcs",
-        category: ToolCategory::Functions,
-        short_desc: "Run auto-analysis and wait for completion",
-        full_desc: "Run IDA auto-analysis and wait for completion. \
-                    Returns whether analysis completed and current function count.",
-        example: r#"{"timeout_secs": 120}"#,
-        default: false,
-        keywords: &["analyze", "functions", "analysis", "auto"],
-    },
 
     // === DISASSEMBLY ===
-    ToolInfo {
+ToolInfo {
         name: "disasm",
         category: ToolCategory::Disassembly,
         short_desc: "Disassemble instructions at an address",
@@ -305,28 +285,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["disassemble", "disasm", "assembly", "instructions", "code"],
     },
-    ToolInfo {
-        name: "disasm_by_name",
-        category: ToolCategory::Disassembly,
-        short_desc: "Disassemble a function by name",
-        full_desc: "Disassemble a function given its name. Resolves the name to an address \
-                    and disassembles the specified number of instructions.",
-        example: r#"{"name": "main", "count": 50}"#,
-        default: false,
-        keywords: &["disassemble", "function", "name", "assembly"],
-    },
-    ToolInfo {
-        name: "disasm_function_at",
-        category: ToolCategory::Disassembly,
-        short_desc: "Disassemble the function containing an address",
-        full_desc: "Disassemble the function that contains the provided address. \
-                    Useful when you only have a PC/LR.",
-        example: r#"{"address": "0x1000", "count": 200}"#,
-        default: false,
-        keywords: &["disassemble", "function", "address", "pc", "lr"],
-    },
 
-    // === DECOMPILE ===
+// === DECOMPILE ===
     ToolInfo {
         name: "decompile",
         category: ToolCategory::Decompile,
@@ -467,43 +427,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["string", "read", "text", "ascii", "data"],
     },
-    ToolInfo {
-        name: "get_u8",
-        category: ToolCategory::Memory,
-        short_desc: "Read 8-bit value",
-        full_desc: "Read an unsigned 8-bit value (byte) at the specified address.",
-        example: r#"{"address": "0x1000"}"#,
-        default: false,
-        keywords: &["byte", "u8", "read", "value"],
-    },
-    ToolInfo {
-        name: "get_u16",
-        category: ToolCategory::Memory,
-        short_desc: "Read 16-bit value",
-        full_desc: "Read an unsigned 16-bit value (word) at the specified address.",
-        example: r#"{"address": "0x1000"}"#,
-        default: false,
-        keywords: &["word", "u16", "read", "value"],
-    },
-    ToolInfo {
-        name: "get_u32",
-        category: ToolCategory::Memory,
-        short_desc: "Read 32-bit value",
-        full_desc: "Read an unsigned 32-bit value (dword) at the specified address.",
-        example: r#"{"address": "0x1000"}"#,
-        default: false,
-        keywords: &["dword", "u32", "read", "value"],
-    },
-    ToolInfo {
-        name: "get_u64",
-        category: ToolCategory::Memory,
-        short_desc: "Read 64-bit value",
-        full_desc: "Read an unsigned 64-bit value (qword) at the specified address.",
-        example: r#"{"address": "0x1000"}"#,
-        default: false,
-        keywords: &["qword", "u64", "read", "value"],
-    },
-    ToolInfo {
+ToolInfo {
         name: "get_global_value",
         category: ToolCategory::Memory,
         short_desc: "Read global value by name or address",
@@ -511,6 +435,29 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         example: r#"{"query": "g_flag"}"#,
         default: false,
         keywords: &["global", "value", "read", "symbol", "data"],
+    },
+    ToolInfo {
+        name: "get_int",
+        category: ToolCategory::Memory,
+        short_desc: "Read typed integers at addresses",
+        full_desc: "Read typed integer values from memory addresses. \
+                    Type format: [iu][8|16|32|64][le|be]? — e.g. u16le, i32be, u8. \
+                    Supports batch queries with an array of {addr, ty} objects. \
+                    Default endianness is little-endian.",
+        example: r#"{"queries": {"addr": "0x1000", "ty": "u32le"}}"#,
+        default: false,
+        keywords: &["int", "read", "integer", "memory", "byte", "word", "dword", "qword"],
+    },
+    ToolInfo {
+        name: "put_int",
+        category: ToolCategory::Memory,
+        short_desc: "Write typed integers at addresses",
+        full_desc: "Write typed integer values to memory addresses. \
+                    Same type format as get_int. Value can be decimal, hex (0x..), or negative. \
+                    Supports batch writes with an array of {addr, ty, value} objects.",
+        example: r#"{"items": {"addr": "0x1000", "ty": "u8", "value": "0x90"}}"#,
+        default: false,
+        keywords: &["int", "write", "integer", "memory", "patch", "byte"],
     },
     ToolInfo {
         name: "int_convert",
@@ -523,6 +470,31 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     },
 
     // === SEARCH ===
+    ToolInfo {
+        name: "find",
+        category: ToolCategory::Search,
+        short_desc: "Unified search (string/immediate/data_ref/code_ref)",
+        full_desc: "Search for patterns in the binary with 4 modes: \
+                    'string' — search for text in disassembly, \
+                    'immediate' — search for immediate values in instructions, \
+                    'data_ref' — find data cross-references to an address, \
+                    'code_ref' — find code cross-references to an address. \
+                    Supports batch targets.",
+        example: r#"{"type": "string", "targets": "main", "limit": 100}"#,
+        default: false,
+        keywords: &["find", "search", "string", "immediate", "data_ref", "code_ref", "xref"],
+    },
+    ToolInfo {
+        name: "find_regex",
+        category: ToolCategory::Search,
+        short_desc: "Search strings with regex patterns",
+        full_desc: "Search the string list using case-insensitive regex patterns. \
+                    Returns matching strings with their addresses. \
+                    Useful for finding URLs, paths, format strings, etc.",
+        example: r#"{"pattern": "http.*://", "limit": 30}"#,
+        default: false,
+        keywords: &["find", "regex", "search", "strings", "pattern", "regular expression"],
+    },
     ToolInfo {
         name: "find_bytes",
         category: ToolCategory::Search,
@@ -822,14 +794,24 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
 
     // === SCRIPTING ===
     ToolInfo {
+        name: "run_script",
+        category: ToolCategory::Scripting,
+        short_desc: "Execute Python code via IDAPython",
+        full_desc: "Execute a Python script via IDAPython in the currently open database. \
+                    Provide either 'code' (inline Python) or 'file' (path to a .py file). \
+                    Has full access to all ida_* modules (ida_funcs, ida_bytes, ida_segment, etc.), \
+                    idc, and idautils. stdout and stderr are captured and returned. \
+                    Returns success status, stdout, stderr, and classified error info if applicable.",
+        example: r#"{"code": "import ida_funcs\nfor i, f in enumerate(ida_funcs.get_fchunk(ida_funcs.get_next_func(0))):\n    print(f)"}"#,
+        default: true,
+        keywords: &["python", "script", "eval", "execute", "idapython", "run"],
+    },
+    ToolInfo {
         name: "py_eval",
         category: ToolCategory::Scripting,
-        short_desc: "Execute Python code in IDA context",
-        full_desc: "Execute Python code in IDA context using IDAPython. \
-                    Can execute expressions (returns a value) or statements. \
-                    Has access to all IDA API modules (idaapi, idc, ida_*, etc.). \
-                    Returns a result object with success status, result value, and any error message. \
-                    NOTE: Requires IDAPython to be loaded in the IDA installation.",
+        short_desc: "Execute Python code in IDA context (deprecated)",
+        full_desc: "Deprecated: use run_script instead. \
+                    Execute Python code in IDA context using IDAPython.",
         example: r#"{"code": "idc.get_func_name(0x401000)"}"#,
         default: false,
         keywords: &["python", "script", "eval", "execute", "idapython"],

@@ -1,6 +1,6 @@
 [package]
 name = "ida-mcp"
-version = "0.1.0"
+version = "0.9.3"
 edition = "2021"
 description = "Headless IDA Pro MCP Server"
 license = "MIT"
@@ -10,8 +10,8 @@ keywords = ["ida", "mcp", "reverse-engineering", "disassembly", "decompiler"]
 categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
-idalib = { git = "https://github.com/blacktop/idalib.git", branch = "disasm-line" }
-rmcp = { version = "0.13", features = ["server", "transport-io", "transport-streamable-http-server"] }
+idalib = { git = "https://github.com/blacktop/idalib.git", branch = "sdk-9.3" }
+rmcp = { version = "0.15", features = ["server", "transport-io", "transport-streamable-http-server"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "signal"] }
 tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }
@@ -29,6 +29,10 @@ bytes = "1"
 http-body = "1"
 http-body-util = "0.1"
 tower-service = "0.3"
+reqwest = { version = "0.12", features = ["json"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4"] }
+regex = "1"
 
 [build-dependencies]
-idalib-build = { git = "https://github.com/blacktop/idalib.git", branch = "disasm-line", package = "idalib-build" }
+idalib-build = { git = "https://github.com/blacktop/idalib.git", branch = "sdk-9.3", package = "idalib-build" }

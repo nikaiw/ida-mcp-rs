@@ -153,6 +153,7 @@ impl IdaWorker {
     }
 
     /// Open an IDA database file.
+    #[allow(clippy::too_many_arguments)]
     pub async fn open(
         &self,
         path: &str,
@@ -160,6 +161,9 @@ impl IdaWorker {
         debug_info_path: Option<String>,
         debug_info_verbose: bool,
         force: bool,
+        file_type: Option<String>,
+        auto_analyse: bool,
+        extra_args: Vec<String>,
     ) -> Result<DbInfo, ToolError> {
         let (tx, rx) = oneshot::channel();
         self.try_send(IdaRequest::Open {
@@ -168,6 +172,9 @@ impl IdaWorker {
             debug_info_path,
             debug_info_verbose,
             force,
+            file_type,
+            auto_analyse,
+            extra_args,
             resp: tx,
         })?;
         rx.await?
@@ -1026,5 +1033,76 @@ impl IdaWorker {
             resp: tx,
         })?;
         rx.await?
+    }
+
+    /// Run a Python script via IDAPython in the open database.
+    pub async fn run_script(
+        &self,
+        code: &str,
+        timeout_secs: Option<u64>,
+    ) -> Result<serde_json::Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::RunScript {
+            code: code.to_string(),
+            resp: tx,
+        })?;
+        Self::recv_with_timeout(rx, timeout_secs).await
+    }
+
+    /// Read a typed integer at an address (e.g. u16le, i32be).
+    pub async fn get_int(&self, addr: u64, ty: String) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::GetInt { addr, ty, resp: tx })?;
+        rx.await?
+    }
+
+    /// Write a typed integer at an address.
+    pub async fn put_int(&self, addr: u64, ty: String, value: String) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::PutInt {
+            addr,
+            ty,
+            value,
+            resp: tx,
+        })?;
+        rx.await?
+    }
+
+    /// Unified search (string, immediate, data_ref, code_ref).
+    pub async fn find(
+        &self,
+        kind: String,
+        targets: Vec<String>,
+        limit: usize,
+        offset: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::Find {
+            kind,
+            targets,
+            limit,
+            offset,
+            resp: tx,
+        })?;
+        Self::recv_with_timeout(rx, timeout_secs).await
+    }
+
+    /// Regex search on strings.
+    pub async fn find_regex(
+        &self,
+        pattern: String,
+        limit: usize,
+        offset: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::FindRegex {
+            pattern,
+            limit,
+            offset,
+            resp: tx,
+        })?;
+        Self::recv_with_timeout(rx, timeout_secs).await
     }
 }

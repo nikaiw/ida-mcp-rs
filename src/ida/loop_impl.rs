@@ -25,13 +25,24 @@ macro_rules! log_result {
 
 /// Run the IDA worker loop on the current (main) thread.
 /// This function blocks until Shutdown is received.
-/// IDA must already be initialized via `idalib::init_library()` before calling this.
-pub fn run_ida_loop_no_init(rx: mpsc::Receiver<IdaRequest>) {
+///
+/// IDA library initialization is deferred until the first request
+/// that needs it. This allows external tools (e.g. `idat`) to run
+/// without license contention.
+pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>) {
     let mut idb: Option<IDB> = None;
     let mut lock_file: Option<File> = None;
     let mut lock_path: Option<PathBuf> = None;
+    let mut ida_initialized = false;
 
     while let Ok(req) = rx.recv() {
+        // Lazy-init IDA on first non-Shutdown request
+        if !ida_initialized && !matches!(req, IdaRequest::Shutdown) {
+            info!("Initializing IDA library (deferred, first request)");
+            idalib::init_library();
+            ida_initialized = true;
+            info!("IDA library initialized successfully");
+        }
         match req {
             IdaRequest::Open {
                 path,
@@ -39,9 +50,12 @@ pub fn run_ida_loop_no_init(rx: mpsc::Receiver<IdaRequest>) {
                 debug_info_path,
                 debug_info_verbose,
                 force,
+                file_type,
+                auto_analyse,
+                extra_args,
                 resp,
             } => {
-                info!(path = %path, force, "Opening database");
+                info!(path = %path, force, file_type = ?file_type, auto_analyse, "Opening database");
                 let result = database::handle_open(
                     &mut idb,
                     &mut lock_file,
@@ -51,6 +65,9 @@ pub fn run_ida_loop_no_init(rx: mpsc::Receiver<IdaRequest>) {
                     debug_info_path.as_deref(),
                     debug_info_verbose,
                     force,
+                    file_type.as_deref(),
+                    auto_analyse,
+                    &extra_args,
                 );
                 match &result {
                     Ok(info) => info!(
@@ -924,6 +941,66 @@ pub fn run_ida_loop_no_init(rx: mpsc::Receiver<IdaRequest>) {
                     Ok(r) => warn!(error = ?r.error, "Python evaluation failed"),
                     Err(e) => warn!(error = %e, "Python evaluation error"),
                 }
+                let _ = resp.send(result);
+            }
+            IdaRequest::RunScript { code, resp } => {
+                debug!(code_len = code.len(), "Running script");
+                let started = std::time::Instant::now();
+                let result = scripting::handle_run_script(&idb, &code);
+                let elapsed_ms = started.elapsed().as_millis();
+                match &result {
+                    Ok(value) => {
+                        let success = value.get("success").and_then(|v| v.as_bool()) == Some(true);
+                        let stdout_len = value
+                            .get("stdout")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.len())
+                            .unwrap_or(0);
+                        debug!(
+                            success,
+                            stdout_len,
+                            elapsed_ms = elapsed_ms as u64,
+                            "Script completed"
+                        );
+                    }
+                    Err(e) => warn!(error = %e, elapsed_ms = elapsed_ms as u64, "Script failed"),
+                }
+                let _ = resp.send(result);
+            }
+            IdaRequest::GetInt { addr, ty, resp } => {
+                debug!(address = format!("{:#x}", addr), ty = %ty, "Getting typed int");
+                let result = memory::handle_get_int(&idb, addr, &ty);
+                let _ = resp.send(result);
+            }
+            IdaRequest::PutInt {
+                addr,
+                ty,
+                value,
+                resp,
+            } => {
+                debug!(address = format!("{:#x}", addr), ty = %ty, value = %value, "Putting typed int");
+                let result = memory::handle_put_int(&idb, addr, &ty, &value);
+                let _ = resp.send(result);
+            }
+            IdaRequest::Find {
+                kind,
+                targets,
+                limit,
+                offset,
+                resp,
+            } => {
+                debug!(kind = %kind, targets = ?targets, limit, offset, "Unified find");
+                let result = search::handle_find(&idb, &kind, &targets, limit, offset);
+                let _ = resp.send(result);
+            }
+            IdaRequest::FindRegex {
+                pattern,
+                limit,
+                offset,
+                resp,
+            } => {
+                debug!(pattern = %pattern, limit, offset, "Finding regex in strings");
+                let result = strings::handle_find_regex(&idb, &pattern, limit, offset);
                 let _ = resp.send(result);
             }
             IdaRequest::Shutdown => {

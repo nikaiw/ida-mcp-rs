@@ -3,6 +3,7 @@
 use crate::disasm::generate_disasm_line;
 use crate::error::ToolError;
 use crate::ida::handlers::parse_pattern;
+use idalib::xref::XRefQuery;
 use idalib::IDB;
 use serde_json::{json, Value};
 
@@ -266,6 +267,121 @@ pub fn handle_find_insns(
         "matches": matches,
         "count": matches.len()
     }))
+}
+
+/// Unified search: string, immediate, data_ref, code_ref.
+pub fn handle_find(
+    idb: &Option<IDB>,
+    kind: &str,
+    targets: &[String],
+    limit: usize,
+    offset: usize,
+) -> Result<Value, ToolError> {
+    let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+
+    let mut all_results = Vec::new();
+    let max_collect = (offset + limit).min(20000);
+
+    for target in targets {
+        let matches: Vec<Value> = match kind {
+            "string" => {
+                let mut out = Vec::new();
+                for addr in db.find_text_iter(target) {
+                    out.push(json!({
+                        "addr": format!("{:#x}", addr),
+                        "target": target,
+                    }));
+                    if out.len() >= max_collect {
+                        break;
+                    }
+                }
+                out
+            }
+            "immediate" | "imm" => {
+                let imm = parse_target_as_u64(target)?;
+                let imm32 = imm as u32;
+                let mut out = Vec::new();
+                for addr in db.find_imm_iter(imm32) {
+                    out.push(json!({
+                        "addr": format!("{:#x}", addr),
+                        "target": format!("{:#x}", imm),
+                    }));
+                    if out.len() >= max_collect {
+                        break;
+                    }
+                }
+                out
+            }
+            "data_ref" => {
+                let target_addr = parse_target_as_u64(target)?;
+                collect_xrefs_filtered(db, target_addr, false, max_collect)
+            }
+            "code_ref" => {
+                let target_addr = parse_target_as_u64(target)?;
+                collect_xrefs_filtered(db, target_addr, true, max_collect)
+            }
+            _ => {
+                return Err(ToolError::InvalidParams(format!(
+                    "unknown search type: '{}'. Use: string, immediate, data_ref, code_ref",
+                    kind
+                )));
+            }
+        };
+
+        let total = matches.len();
+        let sliced: Vec<Value> = matches.into_iter().skip(offset).take(limit).collect();
+        let next_offset = if offset + limit < total {
+            Some(offset + limit)
+        } else {
+            None
+        };
+
+        all_results.push(json!({
+            "target": target,
+            "type": kind,
+            "matches": sliced,
+            "n": sliced.len(),
+            "total": total,
+            "next_offset": next_offset,
+        }));
+    }
+
+    if all_results.len() == 1 {
+        Ok(all_results.into_iter().next().unwrap())
+    } else {
+        Ok(json!({ "results": all_results }))
+    }
+}
+
+fn parse_target_as_u64(s: &str) -> Result<u64, ToolError> {
+    let s = s.trim();
+    if s.starts_with("0x") || s.starts_with("0X") {
+        u64::from_str_radix(&s[2..], 16)
+            .map_err(|_| ToolError::InvalidParams(format!("invalid address/value: {s}")))
+    } else {
+        s.parse::<u64>()
+            .map_err(|_| ToolError::InvalidParams(format!("invalid address/value: {s}")))
+    }
+}
+
+fn collect_xrefs_filtered(db: &IDB, addr: u64, is_code: bool, max: usize) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut current = db.first_xref_to(addr, XRefQuery::ALL);
+    while let Some(xref) = current {
+        if xref.is_code() == is_code {
+            out.push(json!({
+                "addr": format!("{:#x}", xref.from()),
+                "target": format!("{:#x}", addr),
+                "type": format!("{:?}", xref.type_()),
+                "is_code": xref.is_code(),
+            }));
+            if out.len() >= max {
+                break;
+            }
+        }
+        current = xref.next_to();
+    }
+    out
 }
 
 pub fn handle_find_insn_operands(

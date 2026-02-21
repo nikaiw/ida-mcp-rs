@@ -13,6 +13,9 @@ pub enum IdaRequest {
         debug_info_path: Option<String>,
         debug_info_verbose: bool,
         force: bool,
+        file_type: Option<String>,
+        auto_analyse: bool,
+        extra_args: Vec<String>,
         resp: oneshot::Sender<Result<DbInfo, ToolError>>,
     },
     Close {
@@ -335,6 +338,34 @@ pub enum IdaRequest {
         code: String,
         current_ea: Option<u64>,
         resp: oneshot::Sender<Result<PyEvalResult, ToolError>>,
+    },
+    RunScript {
+        code: String,
+        resp: oneshot::Sender<Result<Value, ToolError>>,
+    },
+    GetInt {
+        addr: u64,
+        ty: String,
+        resp: oneshot::Sender<Result<Value, ToolError>>,
+    },
+    PutInt {
+        addr: u64,
+        ty: String,
+        value: String,
+        resp: oneshot::Sender<Result<Value, ToolError>>,
+    },
+    Find {
+        kind: String,
+        targets: Vec<String>,
+        limit: usize,
+        offset: usize,
+        resp: oneshot::Sender<Result<Value, ToolError>>,
+    },
+    FindRegex {
+        pattern: String,
+        limit: usize,
+        offset: usize,
+        resp: oneshot::Sender<Result<Value, ToolError>>,
     },
     Shutdown,
 }
