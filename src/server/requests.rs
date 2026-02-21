@@ -321,6 +321,16 @@ pub struct AddressRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct PaginatedAddressRequest {
+    #[schemars(description = "Address(es) (string/number or array)")]
+    #[serde(alias = "addrs", alias = "addr", alias = "addresses")]
+    pub address: Value,
+    #[schemars(description = "Maximum results to return (default: 100, max: 10000)")]
+    #[serde(alias = "count")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetBytesRequest {
     #[schemars(description = "Address(es) to read from (string/number or array)")]
     #[serde(alias = "addrs", alias = "addr", alias = "addresses")]

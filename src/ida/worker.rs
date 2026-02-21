@@ -546,16 +546,16 @@ impl IdaWorker {
     }
 
     /// Get cross-references to an address.
-    pub async fn xrefs_to(&self, addr: u64) -> Result<Vec<XRefInfo>, ToolError> {
+    pub async fn xrefs_to(&self, addr: u64, limit: usize) -> Result<Vec<XRefInfo>, ToolError> {
         let (tx, rx) = oneshot::channel();
-        self.try_send(IdaRequest::XRefsTo { addr, resp: tx })?;
+        self.try_send(IdaRequest::XRefsTo { addr, limit, resp: tx })?;
         rx.await?
     }
 
     /// Get cross-references from an address.
-    pub async fn xrefs_from(&self, addr: u64) -> Result<Vec<XRefInfo>, ToolError> {
+    pub async fn xrefs_from(&self, addr: u64, limit: usize) -> Result<Vec<XRefInfo>, ToolError> {
         let (tx, rx) = oneshot::channel();
-        self.try_send(IdaRequest::XRefsFrom { addr, resp: tx })?;
+        self.try_send(IdaRequest::XRefsFrom { addr, limit, resp: tx })?;
         rx.await?
     }
 
@@ -707,23 +707,23 @@ impl IdaWorker {
     }
 
     /// Get basic blocks for a function.
-    pub async fn basic_blocks(&self, addr: u64) -> Result<Vec<BasicBlockInfo>, ToolError> {
+    pub async fn basic_blocks(&self, addr: u64, limit: usize) -> Result<Vec<BasicBlockInfo>, ToolError> {
         let (tx, rx) = oneshot::channel();
-        self.try_send(IdaRequest::BasicBlocks { addr, resp: tx })?;
+        self.try_send(IdaRequest::BasicBlocks { addr, limit, resp: tx })?;
         rx.await?
     }
 
     /// Get functions called by a function.
-    pub async fn callees(&self, addr: u64) -> Result<Vec<FunctionInfo>, ToolError> {
+    pub async fn callees(&self, addr: u64, limit: usize) -> Result<Vec<FunctionInfo>, ToolError> {
         let (tx, rx) = oneshot::channel();
-        self.try_send(IdaRequest::Callees { addr, resp: tx })?;
+        self.try_send(IdaRequest::Callees { addr, limit, resp: tx })?;
         rx.await?
     }
 
     /// Get functions that call a function.
-    pub async fn callers(&self, addr: u64) -> Result<Vec<FunctionInfo>, ToolError> {
+    pub async fn callers(&self, addr: u64, limit: usize) -> Result<Vec<FunctionInfo>, ToolError> {
         let (tx, rx) = oneshot::channel();
-        self.try_send(IdaRequest::Callers { addr, resp: tx })?;
+        self.try_send(IdaRequest::Callers { addr, limit, resp: tx })?;
         rx.await?
     }
 

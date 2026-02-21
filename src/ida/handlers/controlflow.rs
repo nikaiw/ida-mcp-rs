@@ -8,7 +8,11 @@ use idalib::IDB;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 
-pub fn handle_basic_blocks(idb: &Option<IDB>, addr: u64) -> Result<Vec<BasicBlockInfo>, ToolError> {
+pub fn handle_basic_blocks(
+    idb: &Option<IDB>,
+    addr: u64,
+    limit: usize,
+) -> Result<Vec<BasicBlockInfo>, ToolError> {
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
 
     let func = db
@@ -19,6 +23,9 @@ pub fn handle_basic_blocks(idb: &Option<IDB>, addr: u64) -> Result<Vec<BasicBloc
 
     let mut blocks = Vec::new();
     for block in cfg.blocks() {
+        if blocks.len() >= limit {
+            break;
+        }
         let block_type = if block.is_normal() {
             "normal"
         } else if block.is_ret() {
@@ -60,7 +67,11 @@ pub fn handle_basic_blocks(idb: &Option<IDB>, addr: u64) -> Result<Vec<BasicBloc
     Ok(blocks)
 }
 
-pub fn handle_callees(idb: &Option<IDB>, addr: u64) -> Result<Vec<FunctionInfo>, ToolError> {
+pub fn handle_callees(
+    idb: &Option<IDB>,
+    addr: u64,
+    limit: usize,
+) -> Result<Vec<FunctionInfo>, ToolError> {
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
 
     let func = db
@@ -76,6 +87,9 @@ pub fn handle_callees(idb: &Option<IDB>, addr: u64) -> Result<Vec<FunctionInfo>,
     let mut current_addr = start;
 
     while current_addr < end {
+        if callees.len() >= limit {
+            break;
+        }
         if let Some(xref) = db.first_xref_from(current_addr, XRefQuery::ALL) {
             let mut xr = Some(xref);
             while let Some(x) = xr {
@@ -92,6 +106,9 @@ pub fn handle_callees(idb: &Option<IDB>, addr: u64) -> Result<Vec<FunctionInfo>,
                                     .unwrap_or_else(|| format!("sub_{:x}", target)),
                                 size: target_func.len(),
                             });
+                            if callees.len() >= limit {
+                                break;
+                            }
                         }
                     }
                 }
@@ -113,7 +130,11 @@ pub fn handle_callees(idb: &Option<IDB>, addr: u64) -> Result<Vec<FunctionInfo>,
     Ok(callees)
 }
 
-pub fn handle_callers(idb: &Option<IDB>, addr: u64) -> Result<Vec<FunctionInfo>, ToolError> {
+pub fn handle_callers(
+    idb: &Option<IDB>,
+    addr: u64,
+    limit: usize,
+) -> Result<Vec<FunctionInfo>, ToolError> {
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
 
     let func = db
@@ -127,6 +148,9 @@ pub fn handle_callers(idb: &Option<IDB>, addr: u64) -> Result<Vec<FunctionInfo>,
     let mut current = db.first_xref_to(func.start_address(), XRefQuery::ALL);
 
     while let Some(xref) = current {
+        if callers.len() >= limit {
+            break;
+        }
         if xref.is_code() {
             let from_addr = xref.from();
             if let Some(caller_func) = db.function_at(from_addr) {
@@ -294,7 +318,7 @@ pub fn handle_callgraph(
             break;
         }
 
-        let callees = handle_callees(idb, cur_addr).unwrap_or_default();
+        let callees = handle_callees(idb, cur_addr, max_nodes).unwrap_or_default();
         for callee in callees {
             if let Ok(target_addr) = parse_address_str(&callee.address) {
                 edges.push((cur_addr, target_addr));

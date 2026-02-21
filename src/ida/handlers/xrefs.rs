@@ -7,13 +7,20 @@ use idalib::IDB;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
-pub fn handle_xrefs_to(idb: &Option<IDB>, addr: u64) -> Result<Vec<XRefInfo>, ToolError> {
+pub fn handle_xrefs_to(
+    idb: &Option<IDB>,
+    addr: u64,
+    limit: usize,
+) -> Result<Vec<XRefInfo>, ToolError> {
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
 
     let mut xrefs = Vec::new();
     let mut current = db.first_xref_to(addr, XRefQuery::ALL);
 
     while let Some(xref) = current {
+        if xrefs.len() >= limit {
+            break;
+        }
         xrefs.push(XRefInfo {
             from: format!("{:#x}", xref.from()),
             to: format!("{:#x}", xref.to()),
@@ -26,13 +33,20 @@ pub fn handle_xrefs_to(idb: &Option<IDB>, addr: u64) -> Result<Vec<XRefInfo>, To
     Ok(xrefs)
 }
 
-pub fn handle_xrefs_from(idb: &Option<IDB>, addr: u64) -> Result<Vec<XRefInfo>, ToolError> {
+pub fn handle_xrefs_from(
+    idb: &Option<IDB>,
+    addr: u64,
+    limit: usize,
+) -> Result<Vec<XRefInfo>, ToolError> {
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
 
     let mut xrefs = Vec::new();
     let mut current = db.first_xref_from(addr, XRefQuery::ALL);
 
     while let Some(xref) = current {
+        if xrefs.len() >= limit {
+            break;
+        }
         xrefs.push(XRefInfo {
             from: format!("{:#x}", xref.from()),
             to: format!("{:#x}", xref.to()),

@@ -368,7 +368,7 @@ impl IdaMcpServer {
                     }
                 }
                 Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string(&value).unwrap_or_else(|_| format!("{value:?}")),
+                    format_response(&value),
                 )]))
             }
             Err(e) => Ok(e.to_tool_result()),
@@ -457,13 +457,12 @@ impl IdaMcpServer {
                     .collect();
 
                 return Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string(&json!({
+                    format_response(&json!({
                         "category": cat.as_str(),
                         "category_description": cat.description(),
                         "tools": tools,
                         "hint": "Use tool_help(name) for full documentation and examples"
-                    }))
-                    .unwrap(),
+                    })),
                 )]));
             }
         }
@@ -484,12 +483,11 @@ impl IdaMcpServer {
                 .collect();
 
             return Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&json!({
+                format_response(&json!({
                     "query": query,
                     "tools": tools,
                     "hint": "Use tool_help(name) for full documentation and examples"
-                }))
-                .unwrap(),
+                })),
             )]));
         }
 
@@ -507,11 +505,10 @@ impl IdaMcpServer {
             .collect();
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string(&json!({
+            format_response(&json!({
                 "categories": categories,
                 "hint": "Use tool_catalog(category='...') to list tools in a category, or tool_catalog(query='...') to search. tools/list already includes all tools."
-            }))
-            .unwrap(),
+            })),
         )]))
     }
 
@@ -526,14 +523,13 @@ impl IdaMcpServer {
         if let Some(tool) = tool_registry::get_tool(&req.name) {
             let params = tool_params_schema(&req.name);
             Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&json!({
+                format_response(&json!({
                     "name": tool.name,
                     "category": tool.category.as_str(),
                     "description": tool.full_desc,
                     "parameters": params,
                     "example": tool.example,
-                }))
-                .unwrap(),
+                })),
             )]))
         } else {
             // Suggest similar tools
@@ -541,12 +537,11 @@ impl IdaMcpServer {
             let suggestion_names: Vec<_> = suggestions.iter().map(|(t, _)| t.name).collect();
 
             Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&json!({
+                format_response(&json!({
                     "error": format!("Tool '{}' not found", req.name),
                     "suggestions": suggestion_names,
                     "hint": "Use tool_catalog to discover available tools"
-                }))
-                .unwrap(),
+                })),
             )]))
         }
     }
@@ -674,8 +669,7 @@ impl IdaMcpServer {
                 }
             }
             Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
+                format_response(&json!({ "results": results })),
             )]))
         }
     }
@@ -712,8 +706,7 @@ impl IdaMcpServer {
                 }
             }
             Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
+                format_response(&json!({ "results": results })),
             )]))
         }
     }
@@ -761,8 +754,7 @@ impl IdaMcpServer {
                 }
             }
             Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
+                format_response(&json!({ "results": results })),
             )]))
         }
     }
@@ -863,16 +855,17 @@ impl IdaMcpServer {
     #[instrument(skip(self), fields(address = %req.address))]
     async fn xrefs_to(
         &self,
-        Parameters(req): Parameters<AddressRequest>,
+        Parameters(req): Parameters<PaginatedAddressRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: xrefs_to");
         let addrs = match Self::value_to_addresses(&req.address) {
             Ok(a) => a,
             Err(e) => return Ok(e.to_tool_result()),
         };
+        let limit = req.limit.unwrap_or(100).min(10000);
 
         if addrs.len() == 1 {
-            match self.worker.xrefs_to(addrs[0]).await {
+            match self.worker.xrefs_to(addrs[0], limit).await {
                 Ok(result) => Ok(CallToolResult::success(vec![Content::text(
                     format_response(&result),
                 )])),
@@ -881,7 +874,7 @@ impl IdaMcpServer {
         } else {
             let mut results = Vec::new();
             for addr in addrs {
-                match self.worker.xrefs_to(addr).await {
+                match self.worker.xrefs_to(addr, limit).await {
                     Ok(result) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "xrefs": result
@@ -893,8 +886,7 @@ impl IdaMcpServer {
                 }
             }
             Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
+                format_response(&json!({ "results": results })),
             )]))
         }
     }
@@ -903,16 +895,17 @@ impl IdaMcpServer {
     #[instrument(skip(self), fields(address = %req.address))]
     async fn xrefs_from(
         &self,
-        Parameters(req): Parameters<AddressRequest>,
+        Parameters(req): Parameters<PaginatedAddressRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: xrefs_from");
         let addrs = match Self::value_to_addresses(&req.address) {
             Ok(a) => a,
             Err(e) => return Ok(e.to_tool_result()),
         };
+        let limit = req.limit.unwrap_or(100).min(10000);
 
         if addrs.len() == 1 {
-            match self.worker.xrefs_from(addrs[0]).await {
+            match self.worker.xrefs_from(addrs[0], limit).await {
                 Ok(result) => Ok(CallToolResult::success(vec![Content::text(
                     format_response(&result),
                 )])),
@@ -921,7 +914,7 @@ impl IdaMcpServer {
         } else {
             let mut results = Vec::new();
             for addr in addrs {
-                match self.worker.xrefs_from(addr).await {
+                match self.worker.xrefs_from(addr, limit).await {
                     Ok(result) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "xrefs": result
@@ -933,8 +926,7 @@ impl IdaMcpServer {
                 }
             }
             Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
+                format_response(&json!({ "results": results })),
             )]))
         }
     }
@@ -1023,8 +1015,7 @@ impl IdaMcpServer {
                     }
                 }
                 Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string(&json!({ "results": results }))
-                        .unwrap_or_else(|_| format!("{:?}", results)),
+                    format_response(&json!({ "results": results })),
                 )]))
             }
         } else if let Some(name) = req.target_name.as_ref() {
@@ -1048,16 +1039,17 @@ impl IdaMcpServer {
     #[instrument(skip(self), fields(address = %req.address))]
     async fn basic_blocks(
         &self,
-        Parameters(req): Parameters<AddressRequest>,
+        Parameters(req): Parameters<PaginatedAddressRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: basic_blocks");
         let addrs = match Self::value_to_addresses(&req.address) {
             Ok(a) => a,
             Err(e) => return Ok(e.to_tool_result()),
         };
+        let limit = req.limit.unwrap_or(1000).min(10000);
 
         if addrs.len() == 1 {
-            match self.worker.basic_blocks(addrs[0]).await {
+            match self.worker.basic_blocks(addrs[0], limit).await {
                 Ok(result) => Ok(CallToolResult::success(vec![Content::text(
                     format_response(&result),
                 )])),
@@ -1066,7 +1058,7 @@ impl IdaMcpServer {
         } else {
             let mut results = Vec::new();
             for addr in addrs {
-                match self.worker.basic_blocks(addr).await {
+                match self.worker.basic_blocks(addr, limit).await {
                     Ok(result) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "basic_blocks": result
@@ -1078,8 +1070,7 @@ impl IdaMcpServer {
                 }
             }
             Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
+                format_response(&json!({ "results": results })),
             )]))
         }
     }
@@ -1088,16 +1079,17 @@ impl IdaMcpServer {
     #[instrument(skip(self), fields(address = %req.address))]
     async fn callees(
         &self,
-        Parameters(req): Parameters<AddressRequest>,
+        Parameters(req): Parameters<PaginatedAddressRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: callees");
         let addrs = match Self::value_to_addresses(&req.address) {
             Ok(a) => a,
             Err(e) => return Ok(e.to_tool_result()),
         };
+        let limit = req.limit.unwrap_or(100).min(10000);
 
         if addrs.len() == 1 {
-            match self.worker.callees(addrs[0]).await {
+            match self.worker.callees(addrs[0], limit).await {
                 Ok(result) => Ok(CallToolResult::success(vec![Content::text(
                     format_response(&result),
                 )])),
@@ -1106,7 +1098,7 @@ impl IdaMcpServer {
         } else {
             let mut results = Vec::new();
             for addr in addrs {
-                match self.worker.callees(addr).await {
+                match self.worker.callees(addr, limit).await {
                     Ok(result) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "callees": result
@@ -1118,8 +1110,7 @@ impl IdaMcpServer {
                 }
             }
             Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
+                format_response(&json!({ "results": results })),
             )]))
         }
     }
@@ -1128,16 +1119,17 @@ impl IdaMcpServer {
     #[instrument(skip(self), fields(address = %req.address))]
     async fn callers(
         &self,
-        Parameters(req): Parameters<AddressRequest>,
+        Parameters(req): Parameters<PaginatedAddressRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: callers");
         let addrs = match Self::value_to_addresses(&req.address) {
             Ok(a) => a,
             Err(e) => return Ok(e.to_tool_result()),
         };
+        let limit = req.limit.unwrap_or(100).min(10000);
 
         if addrs.len() == 1 {
-            match self.worker.callers(addrs[0]).await {
+            match self.worker.callers(addrs[0], limit).await {
                 Ok(result) => Ok(CallToolResult::success(vec![Content::text(
                     format_response(&result),
                 )])),
@@ -1146,7 +1138,7 @@ impl IdaMcpServer {
         } else {
             let mut results = Vec::new();
             for addr in addrs {
-                match self.worker.callers(addr).await {
+                match self.worker.callers(addr, limit).await {
                     Ok(result) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "callers": result
@@ -1158,8 +1150,7 @@ impl IdaMcpServer {
                 }
             }
             Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
+                format_response(&json!({ "results": results })),
             )]))
         }
     }
@@ -1292,8 +1283,7 @@ impl IdaMcpServer {
         }
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string(&json!({ "results": results }))
-                .unwrap_or_else(|_| format!("{:?}", results)),
+            format_response(&json!({ "results": results })),
         )]))
     }
 
@@ -1372,8 +1362,7 @@ impl IdaMcpServer {
         }
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string(&json!({ "results": results }))
-                .unwrap_or_else(|_| format!("{:?}", results)),
+            format_response(&json!({ "results": results })),
         )]))
     }
 
@@ -1412,8 +1401,7 @@ impl IdaMcpServer {
                 }
             }
             Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
+                format_response(&json!({ "results": results })),
             )]))
         }
     }
@@ -1452,8 +1440,7 @@ impl IdaMcpServer {
                 }
             }
             Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
+                format_response(&json!({ "results": results })),
             )]))
         }
     }
@@ -1524,8 +1511,7 @@ impl IdaMcpServer {
                 }
             }
             Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
+                format_response(&json!({ "results": results })),
             )]))
         }
     }
@@ -1627,8 +1613,7 @@ impl IdaMcpServer {
         }
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string(&json!({ "results": results }))
-                .unwrap_or_else(|_| format!("{:?}", results)),
+            format_response(&json!({ "results": results })),
         )]))
     }
 
@@ -1909,8 +1894,7 @@ impl IdaMcpServer {
                 }
             }
             Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
+                format_response(&json!({ "results": results })),
             )]))
         }
     }
@@ -2161,8 +2145,7 @@ impl IdaMcpServer {
             )]))
         } else {
             Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&json!({"results": results}))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
+                format_response(&json!({"results": results})),
             )]))
         }
     }
@@ -2230,8 +2213,7 @@ impl IdaMcpServer {
             )]))
         } else {
             Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&json!({"results": results}))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
+                format_response(&json!({"results": results})),
             )]))
         }
     }
@@ -2409,9 +2391,9 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "pseudocode_at" => Some(schema::<PseudocodeAtRequest>()),
 
         // Xrefs / Control flow
-        "xrefs_to" | "xrefs_from" => Some(schema::<AddressRequest>()),
+        "xrefs_to" | "xrefs_from" => Some(schema::<PaginatedAddressRequest>()),
         "xref_matrix" => Some(schema::<XrefMatrixRequest>()),
-        "basic_blocks" | "callers" | "callees" => Some(schema::<AddressRequest>()),
+        "basic_blocks" | "callers" | "callees" => Some(schema::<PaginatedAddressRequest>()),
         "find_paths" => Some(schema::<FindPathsRequest>()),
         "callgraph" => Some(schema::<CallGraphRequest>()),
 
@@ -2494,16 +2476,27 @@ impl<S> std::ops::Deref for SanitizedIdaServer<S> {
     }
 }
 
-/// Strips `$schema` keys from tool input schemas in place.
+/// Strips `$schema` keys and per-parameter descriptions from tool input
+/// schemas. Parameter descriptions are only needed for `tool_help` (which
+/// generates schemas on-the-fly); stripping them from `tools/list` saves
+/// ~300-600 bytes per tool.
 fn sanitize_tool_schemas(result: &mut ListToolsResult) {
     for tool in &mut result.tools {
         let schema_arc = &mut tool.input_schema;
-        if let Some(map) = std::sync::Arc::get_mut(schema_arc) {
-            map.remove("$schema");
-        } else {
-            let mut map = (**schema_arc).clone();
-            map.remove("$schema");
-            *schema_arc = std::sync::Arc::new(map);
+        let mut map = (**schema_arc).clone();
+        map.remove("$schema");
+        strip_property_descriptions(&mut map);
+        *schema_arc = std::sync::Arc::new(map);
+    }
+}
+
+/// Recursively strip `description` from property sub-schemas.
+fn strip_property_descriptions(map: &mut serde_json::Map<String, Value>) {
+    if let Some(Value::Object(props)) = map.get_mut("properties") {
+        for (_key, val) in props.iter_mut() {
+            if let Value::Object(prop_map) = val {
+                prop_map.remove("description");
+            }
         }
     }
 }

@@ -447,18 +447,18 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>) {
                 }
                 let _ = resp.send(result);
             }
-            IdaRequest::XRefsTo { addr, resp } => {
+            IdaRequest::XRefsTo { addr, limit, resp } => {
                 debug!(address = format!("{:#x}", addr), "Getting xrefs to");
-                let result = xrefs::handle_xrefs_to(&idb, addr);
+                let result = xrefs::handle_xrefs_to(&idb, addr, limit);
                 match &result {
                     Ok(refs) => debug!(count = refs.len(), "Got xrefs to"),
                     Err(e) => warn!(error = %e, "Failed to get xrefs"),
                 }
                 let _ = resp.send(result);
             }
-            IdaRequest::XRefsFrom { addr, resp } => {
+            IdaRequest::XRefsFrom { addr, limit, resp } => {
                 debug!(address = format!("{:#x}", addr), "Getting xrefs from");
-                let result = xrefs::handle_xrefs_from(&idb, addr);
+                let result = xrefs::handle_xrefs_from(&idb, addr, limit);
                 match &result {
                     Ok(refs) => debug!(count = refs.len(), "Got xrefs from"),
                     Err(e) => warn!(error = %e, "Failed to get xrefs"),
@@ -660,27 +660,27 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>) {
                 }
                 let _ = resp.send(result);
             }
-            IdaRequest::BasicBlocks { addr, resp } => {
+            IdaRequest::BasicBlocks { addr, limit, resp } => {
                 debug!(address = format!("{:#x}", addr), "Getting basic blocks");
-                let result = controlflow::handle_basic_blocks(&idb, addr);
+                let result = controlflow::handle_basic_blocks(&idb, addr, limit);
                 match &result {
                     Ok(bbs) => debug!(count = bbs.len(), "Got basic blocks"),
                     Err(e) => warn!(error = %e, "Failed to get basic blocks"),
                 }
                 let _ = resp.send(result);
             }
-            IdaRequest::Callees { addr, resp } => {
+            IdaRequest::Callees { addr, limit, resp } => {
                 debug!(address = format!("{:#x}", addr), "Getting callees");
-                let result = controlflow::handle_callees(&idb, addr);
+                let result = controlflow::handle_callees(&idb, addr, limit);
                 match &result {
                     Ok(funcs) => debug!(count = funcs.len(), "Got callees"),
                     Err(e) => warn!(error = %e, "Failed to get callees"),
                 }
                 let _ = resp.send(result);
             }
-            IdaRequest::Callers { addr, resp } => {
+            IdaRequest::Callers { addr, limit, resp } => {
                 debug!(address = format!("{:#x}", addr), "Getting callers");
-                let result = controlflow::handle_callers(&idb, addr);
+                let result = controlflow::handle_callers(&idb, addr, limit);
                 match &result {
                     Ok(funcs) => debug!(count = funcs.len(), "Got callers"),
                     Err(e) => warn!(error = %e, "Failed to get callers"),

@@ -152,10 +152,12 @@ pub enum IdaRequest {
     },
     XRefsTo {
         addr: u64,
+        limit: usize,
         resp: oneshot::Sender<Result<Vec<XRefInfo>, ToolError>>,
     },
     XRefsFrom {
         addr: u64,
+        limit: usize,
         resp: oneshot::Sender<Result<Vec<XRefInfo>, ToolError>>,
     },
     XRefsToField {
@@ -217,14 +219,17 @@ pub enum IdaRequest {
     },
     BasicBlocks {
         addr: u64,
+        limit: usize,
         resp: oneshot::Sender<Result<Vec<BasicBlockInfo>, ToolError>>,
     },
     Callees {
         addr: u64,
+        limit: usize,
         resp: oneshot::Sender<Result<Vec<FunctionInfo>, ToolError>>,
     },
     Callers {
         addr: u64,
+        limit: usize,
         resp: oneshot::Sender<Result<Vec<FunctionInfo>, ToolError>>,
     },
     IdbMeta {
