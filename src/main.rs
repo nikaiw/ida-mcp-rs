@@ -16,7 +16,7 @@ use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
 use ida_mcp::{
     disasm::generate_disasm_line, expand_path, ida, DbInfo, FunctionInfo, IdaMcpServer, IdaWorker,
-    ServerMode,
+    SanitizedSessionServer, ServerMode, SessionManager, SessionManagerServer,
 };
 use idalib::{idb::IDBOpenOptions, Address, IDB};
 use rmcp::transport::stdio;
@@ -53,6 +53,8 @@ enum Command {
     ServeHttp(ServeHttpArgs),
     /// Run a direct CLI probe to exercise idalib
     Probe(ProbeArgs),
+    /// Run the multi-session manager (spawns child ida-mcp processes)
+    SessionManager(SessionManagerArgs),
 }
 
 #[derive(Args)]
@@ -60,6 +62,32 @@ struct ServeHttpArgs {
     /// Bind address (e.g., 127.0.0.1:8765)
     #[arg(long, default_value = "127.0.0.1:8765")]
     bind: String,
+    /// SSE keep-alive interval in seconds (0 disables)
+    #[arg(long, default_value_t = 15)]
+    sse_keep_alive_secs: u64,
+    /// Use stateless mode (POST only; no sessions)
+    #[arg(long)]
+    stateless: bool,
+    /// Allowed Origin values (comma-separated). Defaults to localhost only.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "http://localhost,http://127.0.0.1"
+    )]
+    allow_origin: Vec<String>,
+}
+
+#[derive(Args)]
+struct SessionManagerArgs {
+    /// Bind address for the session manager HTTP server (e.g., 127.0.0.1:8765)
+    #[arg(long, default_value = "127.0.0.1:8765")]
+    bind: String,
+    /// Starting port for child session HTTP servers
+    #[arg(long, default_value_t = 13400)]
+    port_range_start: u16,
+    /// Ending port (exclusive) for child session HTTP servers
+    #[arg(long, default_value_t = 13500)]
+    port_range_end: u16,
     /// SSE keep-alive interval in seconds (0 disables)
     #[arg(long, default_value_t = 15)]
     sse_keep_alive_secs: u64,
@@ -180,17 +208,13 @@ fn main() -> anyhow::Result<()> {
         Command::Serve => run_server(),
         Command::ServeHttp(args) => run_server_http(args),
         Command::Probe(args) => run_probe(args),
+        Command::SessionManager(args) => run_session_manager(args),
     }
 }
 
-fn init_ida() -> anyhow::Result<()> {
-    // Initialize IDA library on main thread FIRST, before spawning any threads.
-    // Do NOT hold the idalib global mutex here; IDB::open_* will take it.
-    info!("Initializing IDA library on main thread");
-    idalib::init_library();
-    info!("IDA library initialized successfully");
-    Ok(())
-}
+// IDA library initialization is now deferred to the worker loop's first request.
+// This avoids license contention when external tools (e.g. idat) need to run first.
+// Only the `probe` subcommand initializes eagerly since it doesn't use the worker loop.
 
 async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
     #[cfg(unix)]
@@ -218,8 +242,6 @@ async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
 
 fn run_server() -> anyhow::Result<()> {
     info!("Starting IDA MCP Server (server mode)");
-
-    init_ida()?;
 
     // Create channel for IDA requests
     let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
@@ -276,15 +298,20 @@ fn run_server() -> anyhow::Result<()> {
                 }
             }
             info!("MCP server shutting down");
-            let _ = worker_for_shutdown.close_for_shutdown().await;
-            let _ = worker_for_shutdown.shutdown().await;
+            // Note: close_for_shutdown + shutdown already called by signal handler above;
+            // only call again if the transport closed naturally (no signal).
+            if service.is_none() {
+                // Transport closed naturally, signal handler didn't fire yet
+                let _ = worker_for_shutdown.close_for_shutdown().await;
+                let _ = worker_for_shutdown.shutdown().await;
+            }
             Ok::<_, anyhow::Error>(())
         })
     });
 
     // Run IDA worker loop on main thread (IDA is already initialized above)
     info!("Starting IDA worker loop");
-    ida::run_ida_loop_no_init(rx);
+    ida::run_ida_loop(rx);
     info!("IDA worker loop finished");
 
     // Wait for server thread to finish
@@ -298,8 +325,6 @@ fn run_server() -> anyhow::Result<()> {
 
 fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
     info!("Starting IDA MCP Server (streamable HTTP mode)");
-
-    init_ida()?;
 
     let bind_addr: SocketAddr = args
         .bind
@@ -398,7 +423,7 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
     });
 
     info!("Starting IDA worker loop");
-    ida::run_ida_loop_no_init(rx);
+    ida::run_ida_loop(rx);
     info!("IDA worker loop finished");
 
     if let Err(e) = server_handle.join() {
@@ -409,12 +434,125 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn run_session_manager(args: SessionManagerArgs) -> anyhow::Result<()> {
+    info!("Starting IDA MCP Session Manager");
+
+    let bind_addr: SocketAddr = args
+        .bind
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid bind address: {e}"))?;
+
+    // Create the session manager
+    let manager = Arc::new(SessionManager::new(
+        args.port_range_start,
+        args.port_range_end,
+    ));
+
+    // Run the HTTP server in a tokio runtime
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime");
+
+    let result = rt.block_on(async move {
+        let session_manager_mcp = Arc::new(rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_for_config = cancel.clone();
+        let config = rmcp::transport::streamable_http_server::StreamableHttpServerConfig {
+            sse_keep_alive: if args.sse_keep_alive_secs == 0 {
+                None
+            } else {
+                Some(Duration::from_secs(args.sse_keep_alive_secs))
+            },
+            sse_retry: None,
+            stateful_mode: !args.stateless,
+            cancellation_token: cancel_for_config,
+        };
+
+        let manager_for_factory = manager.clone();
+        let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
+            move || {
+                Ok(SanitizedSessionServer(SessionManagerServer::new(
+                    manager_for_factory.clone(),
+                )))
+            },
+            session_manager_mcp,
+            config,
+        );
+
+        let allowed_origins: std::collections::HashSet<String> = args
+            .allow_origin
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let allowed_origins = Arc::new(allowed_origins);
+        let service = OriginCheckService::new(service, allowed_origins);
+
+        let listener = tokio::net::TcpListener::bind(bind_addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("bind failed: {e}"))?;
+        info!(
+            "Session Manager HTTP server listening on http://{}",
+            bind_addr
+        );
+        info!(
+            "Child sessions will use ports {}-{}",
+            args.port_range_start, args.port_range_end
+        );
+
+        let manager_for_shutdown = manager.clone();
+        let cancel_for_shutdown = cancel.clone();
+        tokio::spawn(async move {
+            if wait_for_shutdown_signal().await.is_ok() {
+                info!("Shutdown signal received");
+                manager_for_shutdown.shutdown_all().await;
+                cancel_for_shutdown.cancel();
+            }
+        });
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    info!("Session Manager shutting down");
+                    break;
+                }
+                res = listener.accept() => {
+                    let (stream, _) = res.map_err(|e| anyhow::anyhow!("accept failed: {e}"))?;
+                    let svc = service.clone();
+                    tokio::spawn(async move {
+                        let io = TokioIo::new(stream);
+                        let conn = http1::Builder::new().serve_connection(
+                            io,
+                            TowerToHyperService::new(svc),
+                        );
+                        if let Err(err) = conn.await {
+                            tracing::error!("http connection error: {err}");
+                        }
+                    });
+                }
+            }
+        }
+        #[allow(unreachable_code)]
+        Ok::<_, anyhow::Error>(())
+    });
+
+    if let Err(err) = result {
+        error!("Session Manager error: {err}");
+    }
+
+    info!("Session Manager stopped");
+    Ok(())
+}
+
 fn run_probe(args: ProbeArgs) -> anyhow::Result<()> {
     info!("Starting IDA MCP Server (probe mode)");
     if let Ok(idadir) = std::env::var("IDADIR") {
         info!("IDADIR={}", idadir);
     }
-    init_ida()?;
+    info!("Initializing IDA library on main thread");
+    idalib::init_library();
+    info!("IDA library initialized successfully");
     if let Ok(ver) = idalib::version() {
         info!(
             "IDA version {}.{}.{}",

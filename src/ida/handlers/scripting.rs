@@ -1,65 +1,121 @@
-//! Python scripting support via extlang API.
+//! Script execution handler.
 
 use crate::error::ToolError;
 use crate::ida::types::PyEvalResult;
 use idalib::IDB;
-use std::ffi::CString;
+use serde_json::{json, Value};
 
-/// Check if Python extlang is available.
-pub fn handle_has_python() -> bool {
-    unsafe { idalib::ffi::py_eval::idalib_has_python_extlang() }
+fn last_non_empty_line(text: &str) -> Option<&str> {
+    text.lines().rev().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
 }
 
-/// Execute Python code in IDA context.
-///
-/// This uses IDA's extlang API to execute Python code through IDAPython.
-/// The code can be either an expression (returns a value) or statements.
+fn classify_python_error(details: &str) -> Option<&'static str> {
+    let lowered = details.to_ascii_lowercase();
+    if lowered.contains("syntaxerror") || lowered.contains("invalid syntax") {
+        return Some("SyntaxError");
+    }
+    if lowered.contains("nameerror") {
+        return Some("NameError");
+    }
+    if lowered.contains("attributeerror") {
+        return Some("AttributeError");
+    }
+    if lowered.contains("importerror") || lowered.contains("modulenotfounderror") {
+        return Some("ImportError");
+    }
+    if lowered.contains("typeerror") {
+        return Some("TypeError");
+    }
+    if lowered.contains("valueerror") {
+        return Some("ValueError");
+    }
+    None
+}
+
+/// Execute Python code via IDAPython in the currently open database.
+pub fn handle_run_script(idb: &Option<IDB>, code: &str) -> Result<Value, ToolError> {
+    let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    let output = db.run_python(code)?;
+    let error_summary = output
+        .error
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| last_non_empty_line(&output.stderr).map(str::to_string));
+    let error_details = format!(
+        "{}\n{}",
+        error_summary.as_deref().unwrap_or_default(),
+        output.stderr
+    );
+    let error_kind = classify_python_error(&error_details);
+
+    let mut result = json!({
+        "success": output.success,
+        "stdout": output.stdout,
+        "stderr": output.stderr,
+    });
+    if let Some(error) = &output.error {
+        result["error"] = json!(error);
+    } else if !output.success {
+        if let Some(summary) = &error_summary {
+            result["error"] = json!(summary);
+        }
+    }
+    if let Some(summary) = &error_summary {
+        result["error_summary"] = json!(summary);
+    }
+    if let Some(kind) = error_kind {
+        result["error_kind"] = json!(kind);
+    }
+    Ok(result)
+}
+
+/// Legacy py_eval stub (kept for backward compatibility).
 pub fn handle_py_eval(
     _idb: &Option<IDB>,
-    code: &str,
-    current_ea: Option<u64>,
+    _code: &str,
+    _current_ea: Option<u64>,
 ) -> Result<PyEvalResult, ToolError> {
-    // Check if a database is open (optional, but useful context)
-    // let _db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    Ok(PyEvalResult {
+        success: false,
+        result: String::new(),
+        error: Some(
+            "py_eval is deprecated; use run_script instead".to_string(),
+        ),
+    })
+}
 
-    let code_cstr = CString::new(code).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+#[cfg(test)]
+mod tests {
+    use super::{classify_python_error, last_non_empty_line};
 
-    // Try to evaluate as an expression first (returns value)
-    // If that fails, try as a snippet (statements)
-    let mut result = idalib::ffi::py_eval::py_eval_result::default();
-
-    // Try expression evaluation first if we have a current EA
-    let ea = current_ea.unwrap_or(0);
-    let ok = unsafe {
-        idalib::ffi::py_eval::idalib_py_eval_expr(code_cstr.as_ptr(), ea, &mut result)
-    };
-
-    if ok && result.success {
-        return Ok(PyEvalResult {
-            success: true,
-            result: result.result,
-            error: None,
-        });
+    #[test]
+    fn classifies_common_python_errors() {
+        assert_eq!(
+            classify_python_error("Traceback\nSyntaxError: invalid syntax"),
+            Some("SyntaxError")
+        );
+        assert_eq!(
+            classify_python_error("NameError: name 'foo' is not defined"),
+            Some("NameError")
+        );
+        assert_eq!(
+            classify_python_error("ModuleNotFoundError: No module named ida_bytes"),
+            Some("ImportError")
+        );
     }
 
-    // If expression eval failed, try as a snippet (statements)
-    let mut result = idalib::ffi::py_eval::py_eval_result::default();
-    let ok = unsafe {
-        idalib::ffi::py_eval::idalib_py_eval_snippet(code_cstr.as_ptr(), &mut result)
-    };
-
-    if ok && result.success {
-        Ok(PyEvalResult {
-            success: true,
-            result: result.result,
-            error: None,
-        })
-    } else {
-        // Return the error
-        Ok(PyEvalResult {
-            success: false,
-            result: String::new(),
-            error: Some(result.error),
-        })
+    #[test]
+    fn finds_last_non_empty_line() {
+        assert_eq!(last_non_empty_line("a\n\nb  \n"), Some("b"));
+        assert_eq!(last_non_empty_line(" \n\t\n"), None);
     }
 }

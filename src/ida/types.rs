@@ -2,6 +2,11 @@
 
 use serde::Serialize;
 
+/// Helper for `#[serde(skip_serializing_if)]` on bool fields.
+fn is_false(v: &bool) -> bool {
+    !v
+}
+
 /// Database info returned after opening
 #[derive(Debug, Clone, Serialize)]
 pub struct DbInfo {
@@ -154,6 +159,7 @@ pub struct FrameMemberInfo {
     pub size_bits: u64,
     pub offset: u64,
     pub size: u64,
+    #[serde(skip_serializing_if = "is_false")]
     pub is_bitfield: bool,
     pub part: String,
 }
@@ -204,6 +210,7 @@ pub struct StructMemberInfo {
     pub size_bits: u64,
     pub offset: u64,
     pub size: u64,
+    #[serde(skip_serializing_if = "is_false")]
     pub is_bitfield: bool,
 }
 
@@ -227,6 +234,7 @@ pub struct StructMemberValue {
     pub size_bits: u64,
     pub offset: u64,
     pub size: u64,
+    #[serde(skip_serializing_if = "is_false")]
     pub is_bitfield: bool,
     pub bytes: String,
 }
@@ -247,6 +255,7 @@ pub struct XRefInfo {
     pub from: String,
     pub to: String,
     pub r#type: String,
+    #[serde(skip_serializing_if = "is_false")]
     pub is_code: bool,
 }
 
@@ -306,6 +315,7 @@ pub struct XrefsToFieldResult {
     pub member_size_bits: u64,
     pub tid: String,
     pub xrefs: Vec<XRefInfo>,
+    #[serde(skip_serializing_if = "is_false")]
     pub truncated: bool,
 }
 
@@ -322,6 +332,7 @@ pub struct ImportInfo {
 pub struct ExportInfo {
     pub address: String,
     pub name: String,
+    #[serde(skip_serializing_if = "is_false")]
     pub is_public: bool,
 }
 
@@ -342,7 +353,9 @@ pub struct BasicBlockInfo {
     pub end: String,
     pub size: usize,
     pub block_type: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub successors: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub predecessors: Vec<String>,
 }
 

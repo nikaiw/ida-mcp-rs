@@ -8,7 +8,7 @@
 //!
 //! IDA **must** run on the main thread. The architecture is:
 //!
-//! - **Main thread**: Runs the IDA worker loop (`ida::run_ida_loop_no_init`).
+//! - **Main thread**: Runs the IDA worker loop (`ida::run_ida_loop`).
 //!   All idalib operations happen here.
 //!
 //! - **Background thread**: Runs the tokio runtime with the async MCP server.
@@ -29,13 +29,10 @@
 //!
 //! ## Function Analysis
 //! - `list_functions`: List all functions (paginated)
-//! - `list_funcs`: Alias for list_functions (ida-pro-mcp compatibility)
 //! - `resolve_function`: Find a function by name
 //! - `function_at`: Find the function containing an address
 //! - `lookup_funcs`: Batch lookup by name/address (ida-pro-mcp compatibility)
 //! - `disasm`: Get disassembly at an address
-//! - `disasm_by_name`: Get disassembly for a function by name
-//! - `disasm_function_at`: Disassemble the function containing an address
 //! - `decompile`: Decompile a function using Hex-Rays
 //! - `pseudocode_at`: Get decompiled pseudocode at an address or address range
 //! - `list_globals`: List named globals (non-function symbols)
@@ -45,7 +42,6 @@
 //! - `segments`: List all segments with permissions and types
 //! - `strings`: List strings with optional filter
 //! - `find_string`: Find strings matching a query
-//! - `analyze_strings`: Strings plus xrefs (ida-pro-mcp compatibility)
 //! - `imports`: List imported symbols
 //! - `exports`: List exported/public symbols
 //! - `export_funcs`: Export functions list (ida-pro-mcp compatibility)
@@ -66,7 +62,6 @@
 //!
 //! ## Memory
 //! - `get_bytes`: Read raw bytes from an address
-//! - `get_u8/get_u16/get_u32/get_u64`: Read integer values
 //! - `get_string`: Read string at address
 //! - `get_global_value`: Resolve global name/address and read value
 //! - `find_bytes`: Find byte patterns
@@ -82,16 +77,21 @@ pub mod disasm;
 pub mod error;
 pub mod ida;
 pub mod server;
+pub mod session;
 pub mod tool_registry;
+pub mod toon;
 
 pub use error::ToolError;
 pub use ida::{
-    run_ida_loop_no_init, AddressInfo, BasicBlockInfo, BytesResult, DbInfo, ExportInfo,
+    run_ida_loop, AddressInfo, BasicBlockInfo, BytesResult, DbInfo, ExportInfo,
     FunctionInfo, FunctionListResult, FunctionRangeInfo, IdaRequest, IdaWorker, ImportInfo,
     SegmentInfo, StringInfo, StringListResult, StringXrefInfo, StringXrefsResult, SymbolInfo,
     XRefInfo,
 };
 pub use server::{IdaMcpServer, ServerMode};
+pub use session::{
+    SanitizedSessionServer, SessionInfo, SessionManager, SessionManagerServer, SessionStatus,
+};
 pub use tool_registry::{ToolCategory, ToolInfo, TOOL_REGISTRY};
 
 /// Expand `~/` prefix to the user's home directory.

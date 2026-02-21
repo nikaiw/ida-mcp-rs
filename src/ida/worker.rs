@@ -193,8 +193,11 @@ impl IdaWorker {
 
     pub async fn close_for_shutdown(&self) -> Result<(), ToolError> {
         let (tx, rx) = oneshot::channel();
-        self.send_with_retry(IdaRequest::Close { resp: tx }, None)
-            .await?;
+        self.send_with_retry(
+            IdaRequest::Close { resp: tx },
+            Some(Duration::from_secs(CLOSE_SEND_TIMEOUT_SECS)),
+        )
+        .await?;
         rx.await.map_err(|_| ToolError::WorkerClosed)
     }
 
@@ -222,7 +225,11 @@ impl IdaWorker {
 
     /// Shutdown the IDA worker loop.
     pub async fn shutdown(&self) -> Result<(), ToolError> {
-        self.send_with_retry(IdaRequest::Shutdown, None).await
+        self.send_with_retry(
+            IdaRequest::Shutdown,
+            Some(Duration::from_secs(CLOSE_SEND_TIMEOUT_SECS)),
+        )
+        .await
     }
 
     /// List functions in the database with pagination.
