@@ -56,7 +56,7 @@ impl PortAllocator {
 
     /// Get the number of available ports.
     pub fn available_count(&self) -> usize {
-        let total = (self.max_port - self.base_port) as usize;
+        let total = self.max_port.saturating_sub(self.base_port) as usize;
         total.saturating_sub(self.allocated_count())
     }
 
@@ -95,6 +95,13 @@ mod tests {
         assert_eq!(allocator.allocate(), Some(13401));
 
         // Still no more available
+        assert_eq!(allocator.allocate(), None);
+    }
+
+    #[test]
+    fn test_inverted_range_returns_zero() {
+        let allocator = PortAllocator::new(13500, 13400);
+        assert_eq!(allocator.available_count(), 0);
         assert_eq!(allocator.allocate(), None);
     }
 

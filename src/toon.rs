@@ -166,13 +166,27 @@ fn encode_value(value: &Value, out: &mut String) {
             }
         }
         Value::Array(arr) => {
-            // Sub-array: join with | delimiter
+            // Sub-array: join with | delimiter, quoting items that contain delimiters
             for (i, item) in arr.iter().enumerate() {
                 if i > 0 {
                     out.push('|');
                 }
                 match item {
-                    Value::String(s) => out.push_str(s),
+                    Value::String(s) => {
+                        if s.contains('|') || s.contains(',') || s.contains('\n') {
+                            out.push('"');
+                            for ch in s.chars() {
+                                if ch == '"' {
+                                    out.push_str("\"\"");
+                                } else {
+                                    out.push(ch);
+                                }
+                            }
+                            out.push('"');
+                        } else {
+                            out.push_str(s);
+                        }
+                    }
                     Value::Number(n) => out.push_str(&n.to_string()),
                     Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
                     other => out.push_str(&other.to_string()),
@@ -180,8 +194,17 @@ fn encode_value(value: &Value, out: &mut String) {
             }
         }
         Value::Object(_) => {
-            // Nested object: fall back to compact JSON
-            out.push_str(&value.to_string());
+            // Nested object: quote as JSON to avoid comma conflicts
+            let json = value.to_string();
+            out.push('"');
+            for ch in json.chars() {
+                if ch == '"' {
+                    out.push_str("\"\"");
+                } else {
+                    out.push(ch);
+                }
+            }
+            out.push('"');
         }
     }
 }
@@ -407,6 +430,36 @@ mod tests {
         assert!(result.contains("0x1000,true,foo"));
         // bar should have address, empty for is_weak, then name
         assert!(result.contains("0x2000,,bar"));
+    }
+
+    #[test]
+    fn test_subarray_with_pipe_delimiter() {
+        #[derive(Serialize)]
+        struct Item {
+            name: String,
+            tags: Vec<String>,
+        }
+        let items = vec![Item {
+            name: "test".into(),
+            tags: vec!["a|b".into(), "c".into()],
+        }];
+        let result = try_encode(&items).unwrap();
+        // Pipe in sub-array item should be quoted
+        assert!(result.contains("\"a|b\"|c"));
+    }
+
+    #[test]
+    fn test_nested_object_quoted() {
+        // Nested objects should be quoted to avoid comma corruption
+        let json: Value = serde_json::json!([
+            {"addr": "0x1000", "meta": {"a": 1, "b": 2}}
+        ]);
+        let arr = json.as_array().unwrap();
+        let result = encode_array(arr).unwrap();
+        // The nested object should be wrapped in escaped quotes:
+        // 0x1000,"{""a"":1,""b"":2}"
+        // Internal commas are inside quotes, so they're not cell delimiters
+        assert!(result.contains("\"{\"\"a\"\":1,\"\"b\"\":2}\""));
     }
 
     #[test]

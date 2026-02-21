@@ -177,7 +177,9 @@ impl IdaWorker {
             extra_args,
             resp: tx,
         })?;
-        rx.await?
+        // open_idb can take minutes for large binaries with auto-analysis;
+        // use MAX_TIMEOUT (10 min) rather than the default 2 min.
+        Self::recv_with_timeout(rx, Some(MAX_TIMEOUT_SECS)).await
     }
 
     /// Close the currently open database.

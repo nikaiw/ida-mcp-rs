@@ -374,24 +374,29 @@ impl SessionManager {
 
     /// Reap any child sessions whose process has exited, releasing their ports.
     async fn reap_dead_sessions(&self) {
-        let mut sessions = self.sessions.write().await;
-        let dead_ids: Vec<String> = sessions
-            .iter_mut()
-            .filter_map(|(id, s)| if !s.is_running() { Some(id.clone()) } else { None })
-            .collect();
+        let dead_ids: Vec<String> = {
+            let mut sessions = self.sessions.write().await;
+            let dead_ids: Vec<String> = sessions
+                .iter_mut()
+                .filter_map(|(id, s)| if !s.is_running() { Some(id.clone()) } else { None })
+                .collect();
 
-        for id in &dead_ids {
-            if let Some(session) = sessions.remove(id) {
-                warn!(session_id = %id, port = session.port(), "Reaping dead session");
-                self.port_allocator.release(session.port());
+            for id in &dead_ids {
+                if let Some(mut session) = sessions.remove(id) {
+                    warn!(session_id = %id, port = session.port(), "Reaping dead session");
+                    // Wait to collect exit status and avoid zombie process
+                    let _ = session.process.wait();
+                    self.port_allocator.release(session.port());
+                }
             }
-        }
+            dead_ids
+        }; // sessions lock dropped here before acquiring active_session_id lock
 
         if !dead_ids.is_empty() {
-            // Clear active session if it was reaped
             let mut active = self.active_session_id.write().await;
             if let Some(ref active_id) = *active {
                 if dead_ids.contains(active_id) {
+                    let sessions = self.sessions.read().await;
                     *active = sessions
                         .iter()
                         .find(|(_, s)| s.status() == SessionStatus::Ready)
@@ -416,7 +421,10 @@ impl SessionManager {
             // Check if the child process is still alive
             if !session.is_running() {
                 let port = session.port();
-                sessions.remove(session_id);
+                if let Some(mut removed) = sessions.remove(session_id) {
+                    // Wait to collect exit status and avoid zombie process
+                    let _ = removed.process.wait();
+                }
                 self.port_allocator.release(port);
                 return Err(SessionError::SessionNotReady(format!(
                     "session {} child process has exited",
@@ -523,14 +531,21 @@ impl SessionManager {
         self.port_allocator.release(port);
 
         // Update active session if needed
-        let mut active = self.active_session_id.write().await;
-        if active.as_deref() == Some(session_id) {
-            // Find another ready session to make active
+        let needs_new_active = {
+            let active = self.active_session_id.read().await;
+            active.as_deref() == Some(session_id)
+        };
+        if needs_new_active {
+            // Acquire sessions first (consistent lock ordering: sessions -> active_session_id)
             let sessions = self.sessions.read().await;
-            *active = sessions
-                .iter()
-                .find(|(_, s)| s.status() == SessionStatus::Ready)
-                .map(|(id, _)| id.clone());
+            let mut active = self.active_session_id.write().await;
+            // Re-check in case another task already updated it
+            if active.as_deref() == Some(session_id) {
+                *active = sessions
+                    .iter()
+                    .find(|(_, s)| s.status() == SessionStatus::Ready)
+                    .map(|(id, _)| id.clone());
+            }
         }
 
         Ok(())

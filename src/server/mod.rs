@@ -2301,6 +2301,11 @@ impl IdaMcpServer {
         let code = match (req.code, req.file) {
             (Some(code), None) => code,
             (None, Some(file_path)) => {
+                if !Self::validate_path(&file_path) {
+                    return Ok(ToolError::InvalidPath(
+                        format!("Invalid script path: {}", file_path),
+                    ).to_tool_result());
+                }
                 match std::fs::read_to_string(&file_path) {
                     Ok(content) => content,
                     Err(e) => return Ok(ToolError::InvalidPath(
