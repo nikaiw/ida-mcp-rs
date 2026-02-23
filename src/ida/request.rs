@@ -339,11 +339,6 @@ pub enum IdaRequest {
         end_addr: Option<u64>,
         resp: oneshot::Sender<Result<Value, ToolError>>,
     },
-    PyEval {
-        code: String,
-        current_ea: Option<u64>,
-        resp: oneshot::Sender<Result<PyEvalResult, ToolError>>,
-    },
     RunScript {
         code: String,
         resp: oneshot::Sender<Result<Value, ToolError>>,

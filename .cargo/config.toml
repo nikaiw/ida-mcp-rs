@@ -1,2 +1,9 @@
-[env]
-IDADIR = "/Applications/IDA Professional 9.2.app/Contents/MacOS"
+# Platform-specific linker settings
+# idalib-sys has duplicate symbol definitions between autocxx-generated code
+# and manual C++ wrapper files. Allow this at link time.
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/FORCE:MULTIPLE"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]

@@ -367,11 +367,3 @@ pub struct BytesResult {
     pub length: usize,
 }
 
-/// Python evaluation result
-#[derive(Debug, Clone, Serialize)]
-pub struct PyEvalResult {
-    pub success: bool,
-    pub result: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}

@@ -1,7 +1,6 @@
 //! Script execution handler.
 
 use crate::error::ToolError;
-use crate::ida::types::PyEvalResult;
 use idalib::IDB;
 use serde_json::{json, Value};
 
@@ -39,7 +38,6 @@ fn classify_python_error(details: &str) -> Option<&'static str> {
     None
 }
 
-/// Execute Python code via IDAPython in the currently open database.
 pub fn handle_run_script(idb: &Option<IDB>, code: &str) -> Result<Value, ToolError> {
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
     let output = db.run_python(code)?;
@@ -78,24 +76,9 @@ pub fn handle_run_script(idb: &Option<IDB>, code: &str) -> Result<Value, ToolErr
     Ok(result)
 }
 
-/// Legacy py_eval stub (kept for backward compatibility).
-pub fn handle_py_eval(
-    _idb: &Option<IDB>,
-    _code: &str,
-    _current_ea: Option<u64>,
-) -> Result<PyEvalResult, ToolError> {
-    Ok(PyEvalResult {
-        success: false,
-        result: String::new(),
-        error: Some(
-            "py_eval is deprecated; use run_script instead".to_string(),
-        ),
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{classify_python_error, last_non_empty_line};
+    use crate::ida::handlers::script::{classify_python_error, last_non_empty_line};
 
     #[test]
     fn classifies_common_python_errors() {

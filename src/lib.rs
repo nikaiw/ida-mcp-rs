@@ -74,6 +74,7 @@
 use std::path::PathBuf;
 
 pub mod disasm;
+pub mod dsc;
 pub mod error;
 pub mod ida;
 pub mod server;
@@ -83,10 +84,9 @@ pub mod toon;
 
 pub use error::ToolError;
 pub use ida::{
-    run_ida_loop, AddressInfo, BasicBlockInfo, BytesResult, DbInfo, ExportInfo,
-    FunctionInfo, FunctionListResult, FunctionRangeInfo, IdaRequest, IdaWorker, ImportInfo,
-    SegmentInfo, StringInfo, StringListResult, StringXrefInfo, StringXrefsResult, SymbolInfo,
-    XRefInfo,
+    run_ida_loop, AddressInfo, BasicBlockInfo, BytesResult, DbInfo, ExportInfo, FunctionInfo,
+    FunctionListResult, FunctionRangeInfo, IdaRequest, IdaWorker, ImportInfo, SegmentInfo,
+    StringInfo, StringListResult, StringXrefInfo, StringXrefsResult, SymbolInfo, XRefInfo,
 };
 pub use server::{IdaMcpServer, ServerMode};
 pub use session::{

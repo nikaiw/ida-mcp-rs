@@ -633,19 +633,6 @@ pub struct ToolHelpRequest {
     pub name: String,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct PyEvalRequest {
-    #[schemars(
-        description = "Python code to execute. Can be an expression (returns value) or statements."
-    )]
-    #[serde(alias = "script", alias = "expression", alias = "expr")]
-    pub code: String,
-    #[schemars(
-        description = "Optional current effective address for context (used in expression evaluation)"
-    )]
-    #[serde(alias = "ea", alias = "addr", alias = "address")]
-    pub current_ea: Option<String>,
-}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetIntRequest {
@@ -702,8 +689,32 @@ pub struct RunScriptRequest {
     )]
     pub code: Option<String>,
     #[schemars(description = "Path to a .py file to execute via IDAPython. \
-        Mutually exclusive with 'code'.")]
+        Alternative to 'code' for longer scripts. The file is read server-side.")]
     pub file: Option<String>,
-    #[schemars(description = "Timeout in seconds for this operation (default: 120, max: 600)")]
+    #[schemars(description = "Execution timeout in seconds (default: 120, max: 600)")]
     pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TaskStatusRequest {
+    #[schemars(description = "Task ID returned by open_dsc (e.g. 'dsc-abc123')")]
+    pub task_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct OpenDscRequest {
+    #[schemars(description = "Path to the dyld_shared_cache file")]
+    pub path: String,
+    #[schemars(description = "CPU architecture (e.g. 'arm64e', 'arm64', 'x86_64h')")]
+    pub arch: String,
+    #[schemars(description = "Primary dylib to load (e.g. '/usr/lib/libobjc.A.dylib')")]
+    pub module: String,
+    #[schemars(description = "Additional frameworks to load after opening \
+        (e.g. ['/System/Library/Frameworks/Foundation.framework/Foundation'])")]
+    pub frameworks: Option<Vec<String>>,
+    #[schemars(description = "IDA version: 8 or 9. Determines the -T format string. Default: 9")]
+    pub ida_version: Option<u8>,
+    #[schemars(description = "Path to write idat's log file (-L flag). \
+        If omitted, no log is created. Useful for debugging DSC loading failures.")]
+    pub log_path: Option<String>,
 }

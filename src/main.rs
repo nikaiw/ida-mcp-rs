@@ -213,7 +213,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 // IDA library initialization is now deferred to the worker loop's first request.
-// This avoids license contention when external tools (e.g. idat) need to run first.
+// This avoids license contention when open_dsc needs to run idat first.
 // Only the `probe` subcommand initializes eagerly since it doesn't use the worker loop.
 
 async fn wait_for_shutdown_signal() -> anyhow::Result<()> {

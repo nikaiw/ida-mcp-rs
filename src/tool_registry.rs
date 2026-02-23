@@ -164,6 +164,19 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         keywords: &["open", "load", "database", "binary", "idb", "i64", "macho", "elf", "pe"],
     },
     ToolInfo {
+        name: "open_dsc",
+        category: ToolCategory::Core,
+        short_desc: "Open a dyld_shared_cache and load a single module",
+        full_desc: "Open an Apple dyld_shared_cache file and extract a single dylib for analysis. \
+                    Handles DSC-specific loader selection and dscu plugin orchestration automatically. \
+                    After opening, runs ObjC type and block analysis on the loaded module. \
+                    Use this instead of open_idb when working with dyld_shared_cache files. \
+                    Optionally load additional frameworks to resolve cross-module references.",
+        example: r#"{"path": "/path/to/dyld_shared_cache_arm64e", "arch": "arm64e", "module": "/usr/lib/libobjc.A.dylib", "frameworks": ["/System/Library/Frameworks/Foundation.framework/Foundation"]}"#,
+        default: false,
+        keywords: &["open", "dsc", "dyld", "shared", "cache", "dylib", "module", "apple", "macos", "ios"],
+    },
+    ToolInfo {
         name: "load_debug_info",
         category: ToolCategory::Core,
         short_desc: "Load external debug info (e.g., dSYM/DWARF)",
@@ -217,6 +230,18 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         example: r#"{"name": "list_functions"}"#,
         default: true,
         keywords: &["help", "docs", "documentation", "schema", "usage"],
+    },
+    ToolInfo {
+        name: "task_status",
+        category: ToolCategory::Core,
+        short_desc: "Check status of a background task (e.g. DSC loading)",
+        full_desc: "Check the status of a background task started by open_dsc. \
+                    Returns 'running' (with progress message), 'completed' (with db_info — \
+                    database is already open and ready for analysis), or 'failed' (with error). \
+                    Use the task_id returned by open_dsc when a new .i64 must be created.",
+        example: r#"{"task_id": "dsc-abc123"}"#,
+        default: true,
+        keywords: &["task", "status", "poll", "background", "dsc", "progress"],
     },
     ToolInfo {
         name: "idb_meta",
@@ -801,20 +826,12 @@ ToolInfo {
                     Provide either 'code' (inline Python) or 'file' (path to a .py file). \
                     Has full access to all ida_* modules (ida_funcs, ida_bytes, ida_segment, etc.), \
                     idc, and idautils. stdout and stderr are captured and returned. \
-                    Returns success status, stdout, stderr, and classified error info if applicable.",
-        example: r#"{"code": "import ida_funcs\nfor i, f in enumerate(ida_funcs.get_fchunk(ida_funcs.get_next_func(0))):\n    print(f)"}"#,
+                    Use this for custom analysis that goes beyond the built-in tools. \
+                    Requires that the IDAPython plugin is loaded (available by default in IDA Pro). \
+                    API reference: https://python.docs.hex-rays.com",
+        example: r#"{"code": "import idautils\nfor f in idautils.Functions():\n    print(hex(f))"}"#,
         default: true,
-        keywords: &["python", "script", "eval", "execute", "idapython", "run"],
-    },
-    ToolInfo {
-        name: "py_eval",
-        category: ToolCategory::Scripting,
-        short_desc: "Execute Python code in IDA context (deprecated)",
-        full_desc: "Deprecated: use run_script instead. \
-                    Execute Python code in IDA context using IDAPython.",
-        example: r#"{"code": "idc.get_func_name(0x401000)"}"#,
-        default: false,
-        keywords: &["python", "script", "eval", "execute", "idapython"],
+        keywords: &["script", "python", "execute", "eval", "idapython", "run", "code", "file"],
     },
 ];
 

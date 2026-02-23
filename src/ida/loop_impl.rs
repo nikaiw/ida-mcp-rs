@@ -3,7 +3,7 @@
 use crate::ida::handlers::resolve_address;
 use crate::ida::handlers::{
     address, analysis, annotations, controlflow, database, disasm, functions, globals, imports,
-    memory, scripting, search, segments, strings, structs, types, xrefs,
+    memory, script, search, segments, strings, structs, types, xrefs,
 };
 use crate::ida::lock::release_mcp_lock;
 use crate::ida::request::IdaRequest;
@@ -27,21 +27,22 @@ macro_rules! log_result {
 /// This function blocks until Shutdown is received.
 ///
 /// IDA library initialization is deferred until the first request
-/// that needs it. This allows external tools (e.g. `idat`) to run
-/// without license contention.
+/// that needs it. This allows `open_dsc` to run `idat` without
+/// license contention (idat needs its own license).
 pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>) {
     let mut idb: Option<IDB> = None;
     let mut lock_file: Option<File> = None;
     let mut lock_path: Option<PathBuf> = None;
-    let mut ida_initialized = false;
+    let mut lib_initialized = false;
 
     while let Ok(req) = rx.recv() {
-        // Lazy-init IDA on first non-Shutdown request
-        if !ida_initialized && !matches!(req, IdaRequest::Shutdown) {
-            info!("Initializing IDA library (deferred, first request)");
+        // Lazily initialize the IDA library on first use.
+        // Must happen on the main thread (which this loop runs on).
+        if !lib_initialized {
+            info!("Initializing IDA library on main thread (deferred)");
             idalib::init_library();
-            ida_initialized = true;
             info!("IDA library initialized successfully");
+            lib_initialized = true;
         }
         match req {
             IdaRequest::Open {
@@ -929,24 +930,10 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>) {
                 }
                 let _ = resp.send(result);
             }
-            IdaRequest::PyEval {
-                code,
-                current_ea,
-                resp,
-            } => {
-                debug!(current_ea = ?current_ea, "Evaluating Python code");
-                let result = scripting::handle_py_eval(&idb, &code, current_ea);
-                match &result {
-                    Ok(r) if r.success => debug!("Python evaluation succeeded"),
-                    Ok(r) => warn!(error = ?r.error, "Python evaluation failed"),
-                    Err(e) => warn!(error = %e, "Python evaluation error"),
-                }
-                let _ = resp.send(result);
-            }
             IdaRequest::RunScript { code, resp } => {
                 debug!(code_len = code.len(), "Running script");
                 let started = std::time::Instant::now();
-                let result = scripting::handle_run_script(&idb, &code);
+                let result = script::handle_run_script(&idb, &code);
                 let elapsed_ms = started.elapsed().as_millis();
                 match &result {
                     Ok(value) => {
@@ -956,14 +943,24 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>) {
                             .and_then(|v| v.as_str())
                             .map(|s| s.len())
                             .unwrap_or(0);
-                        debug!(
-                            success,
-                            stdout_len,
-                            elapsed_ms = elapsed_ms as u64,
-                            "Script completed"
-                        );
+                        let stderr_len = value
+                            .get("stderr")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.len())
+                            .unwrap_or(0);
+                        if success {
+                            debug!(elapsed_ms, stdout_len, stderr_len, "Script executed");
+                        } else {
+                            let error = value.get("error").and_then(|v| v.as_str()).unwrap_or("");
+                            warn!(
+                                elapsed_ms,
+                                stdout_len, stderr_len, error, "Script execution reported failure"
+                            );
+                        }
                     }
-                    Err(e) => warn!(error = %e, elapsed_ms = elapsed_ms as u64, "Script failed"),
+                    Err(e) => {
+                        warn!(elapsed_ms, error = %e, "Failed to execute script");
+                    }
                 }
                 let _ = resp.send(result);
             }
